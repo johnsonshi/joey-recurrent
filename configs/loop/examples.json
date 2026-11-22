@@ -1,0 +1,10 @@
+[
+  {"k": 1, "method": "naive"},
+  {"k": 3, "method": "zero_extra"},
+  {"k": 3, "method": "naive"},
+  {"k": 3, "method": "damped_extra", "alpha": 0.25},
+  {"k": 3, "method": "euler"},
+  {"k": 3, "method": "rk", "beta": 0.5},
+  {"k": 3, "method": "prelude_anchor", "beta": 0.5},
+  {"k": 3, "method": "rk", "beta": 0.5, "readout": "diagnostic"}
+]
