@@ -1,0 +1,25 @@
+{
+  "schema": "joey-constant-evidence-routing/v1",
+  "scope": "Secondary development experiment. In the first routing study, harder paths also had more edges. Hold the displayed graph fixed while varying the number of handoffs actually needed.",
+  "dataset": {
+    "namespace": "fixed-evidence-horizon-v1", "seeds": [920521, 920527], "graphs_per_seed": 48,
+    "roots": 4, "chain_length": 6, "target_hops": [1, 2, 4, 6], "renderings": 2,
+    "task": "fixed_evidence_route", "row_order_salt": "horizon-order-v1:",
+    "design": "Every graph has 24 edges, 28 distinct three-letter stations, and four entry stations. For each entry, query the station reached after 1, 2, 4 and 6 handoffs. The graph and ordered menu are identical for all queries in a rendering. Only the queried station changes. Each goal is also shown with the second wording and independently reordered edge list and menu. Never show hop metadata, IDs, solutions or other examples to the model."
+  },
+  "models": ["full", "select-20"], "window": [8, 12],
+  "fixed_depths": [1, 2, 4, 6, 8],
+  "split_control": {"method": "zero_extra", "k": 2},
+  "analysis": {
+    "primary": "For each payload, compare four naive visits with its split-only control: (accuracy gain at six hops) minus (accuracy gain at two hops). Positive means more gain at the farther target in these fixed graphs. This does not imply one neural traversal executes one graph hop.",
+    "additional": "For each measured depth against split-only, report paired accuracy and summed-Brier changes at each hop and descriptive timing. Also report conditional correction/corruption support and both correct and wrong confidence. Keep native cached stock timing separate from split-only.",
+    "token_control": "Within each graph, semantic entry and rendering, compare the 2-hop and 6-hop goals again only if their actually recorded input token counts are identical. Require each compared method to tokenize the same row identically. Report eligible pairs and independent graphs; withhold unsupported intervals rather than impute.",
+    "strata": ["generator seed"], "resampling_unit": "complete graph including all entries, horizons and renderings",
+    "bootstrap_reps": 2000, "bootstrap_seed": 4117, "intervals": "paired pointwise 95%; not multiplicity-adjusted",
+    "thresholds": [0.8, 0.9, 0.95, 0.99],
+    "caveats": "The identity of the goal changes. Three-character names are equal length in text, not necessarily in tokenizer pieces. Near-target ceiling and variable distractor relevance constrain any mechanistic interpretation."
+  },
+  "hardware": "Original ordinary slots, full on slot zero and physical select-20 on slot one. Each has its own native and split-only control on this fresh cohort.",
+  "capacity": {"attempt_seconds": 2700, "stage_ceiling_gpu_seconds": 32400, "protected_final_gpu_seconds": 12600},
+  "use_for_final_nomination": false, "official_score": false
+}
