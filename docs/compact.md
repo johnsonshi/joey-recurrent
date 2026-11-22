@@ -60,8 +60,10 @@ This counts shared byte ranges once and includes a real FP32 head clone when sup
 ## Evidence and limits
 
 ```sh
-PYTHONPATH=src python -B -m unittest discover -s tests -p 'test_compact.py' -v
+PYTHONPATH=src python -B -m unittest discover -s tests -p 'test_compact*.py' -v
 ```
+
+To budget scalar merge time on a target CPU, run `PYTHONPATH=src python -B tests/bench_compact_merge.py`. The generated BF16 benchmark reads two input matrices, merges them, writes one safetensors file and hashes it. Divide the number of merged MLP **output elements** by `sample_floor_outputs_per_s` for a conservative sample-based time estimate. A planning rule is to allow twice that estimate for the merge stage alone; otherwise use selection. The reported peak is Python-traced temporary memory, not peak device memory. The benchmark excludes source verification, copies of untouched tensors, cache effects at checkpoint scale and inference.
 
 On the generated BF16 fixture, both 16-layer exports reduced stored parameters from **1,502 to 1,020**, payload from **3,004 to 2,040 bytes**, and the actual safetensors file from **39,740 to 26,584 bytes**. A separate reader compared every survivor or merged tensor against the source-based expectation. For `k=1` and `k=2`, a small nonlinear fixture readout matched the corresponding source-weight schedule after reload. This checks serialization and dispatch, **not** parity with the unmodified 24-layer model or official Joey logits. Tiny-file percentages do not predict real savings.
 
