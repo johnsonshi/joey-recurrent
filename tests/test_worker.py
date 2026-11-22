@@ -210,3 +210,108 @@ class WorkerTest(unittest.TestCase):
             # Even an unused out-of-scope entry invalidates the permit.
             with self.subTest(prohibited=prohibited), self.assertRaises(ValueError):
                 admit(base, prohibited)
+
+
+class TypedTransferTest(unittest.TestCase):
+    def test_one_loop_two_reads_and_exact_native_request_for_each_invented_case(self):
+        from joey_research.evaluation import input_sha256
+        from joey_research.native import BranchLayout
+
+        levels = ["Empty (0 units)", "Low (1 to 3 units)", "Medium (4 to 6 units)", "High (7 or more units)"]
+        states = ("Focus: Aster. Opening units: Aster 3, Beryl 4, Umber 0, Coral 2. Aster +1 posted; Beryl +4 pending.",
+                  "Focus: Umber. Opening units: Aster 3, Beryl 1, Umber 0, Coral 5. Umber +8 posted; Aster −3 posted.")
+        for case, state in enumerate(states):
+            depots = ["Aster", "No unique depot", "Beryl", "Umber", "Coral"][::1 if case else -1]
+            for task, menu, kind, instruction, criteria, labels, p in (
+                ("stock-eligibility", ["Yes", "No"], "noul", "After posted entries only, does the focus depot have at least five units?",
+                 {"true": "Yes", "false": "No"}, ("yes", "no"), (.64321089, .35678911)),
+                ("stock-level", levels, "score", "After posted entries only, rate the final stock of the focus depot using the ordered levels.",
+                 levels, ("0", "1", "2", "3"), (.12345671, .2, .3, .37654329)),
+                ("stock-choice", depots, "choice", "After posted entries only, which depot has the most units? "
+                 "If there is no unique maximum, choose No unique depot.",
+                 {f"option_{i}": x for i, x in enumerate(depots)}, tuple(f"option_{i}" for i in range(5)),
+                 (.42345671, .1, .2, .2, .07654329)),
+            ):
+                row = dict(id=f"opaque-{task}-{case}", task=task, group_id="never-forward", prompt=state, choices=menu)
+                q = {"type": kind, "instructions": instruction, "criteria": criteria}
+                raw_pin = input_sha256(row)
+                for depth in (20, 24):
+                    for k, method in ((1, "naive"), (2, "zero_extra"), (2, "naive"), (4, "naive"), (6, "naive")):
+                        with self.subTest(case=case, task=task, depth=depth, k=k, method=method):
+                            logits = object()
+                            calls, reads = [], []
+                            def call(name, value):
+                                calls.append(name)
+                                return value
+                            def read(name, z, value):
+                                self.assertIs(z, logits)
+                                reads.append(name)
+                                return value
+                            answer = {"type": kind}
+                            if kind == "noul":
+                                answer["noul"] = round(p[0], 6)
+                            else:
+                                answer["probabilities"] = {s: round(v, 6) for s, v in zip(labels, p, strict=True)}
+                                answer[kind] = (round(sum(i*v for i, v in enumerate(p)), 6) if kind == "score" else "option_3")
+                            def branches(text, qs, *, window):
+                                self.assertEqual((text, qs, window), (state, {"audit": q}, (8, 12)))
+                                if kind == "choice":
+                                    self.assertEqual(list(qs["audit"]["criteria"].items()), list(criteria.items()))
+                                layout = BranchLayout("audit", kind, labels, tuple(range(len(labels))), 1, (8, 9), ())
+                                return {"audit": SimpleNamespace(labels=layout.labels, layout=layout, fresh_state=object,
+                                    inference_context=contextlib.nullcontext, stock=lambda: call("stock", logits),
+                                    prelude=lambda: call("prelude", 0), block=lambda h, s: call("block", h + 1),
+                                    coda=lambda h, s: call("coda", logits),
+                                    probabilities=lambda z: read("vector", z, p), decode=lambda z: read("decode", z, answer))}
+                            native = SimpleNamespace(branches=branches)
+                            if depth == 20:
+                                native.physical_to_source = (*range(12), *range(16, 24))
+                            with patch.object(worker, "run_loop", wraps=worker.run_loop) as loop:
+                                pred, trace = measure_choice(native, row, (8, 12), LoopPlan(k=k, method=method), split="typed-transfer")
+                            loop.assert_called_once()
+                            blocks = 1 if method == "zero_extra" else k
+                            self.assertEqual(calls, ["stock"] if k == 1 else ["prelude", *(["block"] * blocks), "coda"])
+                            self.assertEqual(trace["callback_counts"], {op + "_calls": calls.count(op) for op in ("stock", "prelude", "block", "coda")})
+                            self.assertEqual((trace["layer_calls"], trace["tokens"], trace["readouts"]), (depth + 4*(blocks - 1), 2, []))
+                            self.assertEqual(reads, ["vector", "decode"])
+                            self.assertIs(trace["transfer_answer"], answer)
+                            self.assertNotIn("native_answer", trace)
+                            self.assertEqual(pred, {"id": row["id"], "input_sha256": raw_pin, "probs": list(p)})
+                            self.assertEqual(input_sha256(row), raw_pin)
+
+    def test_transfer_rejects_wrong_rendered_slots_and_compact_map_before_loop(self):
+        row = dict(id="toy", group_id="g", task="stock-eligibility", prompt="Toy state", choices=["Yes", "No"])
+        branch = SimpleNamespace(labels=("true", "false"))  # criteria keys aren't the rendered noul labels.
+        native = SimpleNamespace(branches=lambda *args, **kw: {"audit": branch})
+        with patch.object(worker, "run_loop") as loop:
+            for changed in ({"reverse": True}, {"policy": Policy()}, {}):
+                with self.assertRaises(ValueError):
+                    measure_choice(native, row, (8, 12), LoopPlan(), split="typed-transfer", **changed)
+            branch.labels = ("yes", "no")
+            native.physical_to_source = tuple(range(20))  # correct depth, wrong retained cycle
+            with self.assertRaises(ValueError):
+                measure_choice(native, row, (8, 12), LoopPlan(), split="typed-transfer")
+            loop.assert_not_called()
+
+    def test_transfer_checks_even_unused_nominations_and_one_compact_pin(self):
+        base = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
+        compact = {"compact_recipe": "select-20", "compact_manifest_sha256": "a"*64}
+        mid = worker.method_sha256(base)
+        def admit(*settings):
+            methods = {mid: base, **{hashlib.sha256(worker._canonical(s)).hexdigest(): s for s in settings}}
+            return worker._nominated(dict(base, split="typed-transfer", method_sha256=mid), methods, {"split", "method_sha256"})
+        approved = [dict(base, loop={"k": k, "method": method, "readout": "final"}, **extras)
+                    for extras in ({}, compact) for k, method in ((1, "naive"), (2, "zero_extra"), (2, "naive"),
+                                                                   (4, "naive"), (6, "naive"))
+                    if extras or k != 1]
+        self.assertEqual(admit(*approved)[2], LoopPlan())
+        for change in ({"compact_manifest_sha256": "a"*64}, {"compact_recipe": "select-20"},
+                       {**compact, "compact_recipe": "select-20-late"}, {**compact, "compact_recipe": "select-16"},
+                       {**compact, "compact_manifest_sha256": "b"*64, "loop": {"k": 4}},
+                       {"reverse": True}, {"window": [4, 8]}, {"policy": {}}, {"ignored": None},
+                       {"loop": {"k": 3}}, {"loop": {"k": 6, "method": "zero_extra"}},
+                       {"loop": {"k": 3, "method": "euler"}}, {"loop": {"k": 2, "readout": "diagnostic"}},
+                       {"loop": {"k": 2, "alpha": None}}, {"loop": {"k": 2, "beta": None}},
+                       {"loop": {"k": 2, "method": "zero_extra"}, "order_ensemble": {"numerator": 0, "denominator": 1, "seed": 0}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                admit(approved[-1], dict(base, **change))

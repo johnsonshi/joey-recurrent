@@ -19,12 +19,25 @@ from .evaluation import input_sha256
 from .loop import LoopPlan, run_loop
 from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
+TRANSFER_MODE = "typed-transfer"
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
           "public-native": "banking77-original-train-native77/v1",
+          TRANSFER_MODE: "joey-native-inventory-development/v1",
           "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
 NATIVE_OPTIONS = tuple(f"option_{i}" for i in range(77))
+SELECT20_LAYERS = (*range(12), *range(16, 24))
+TRANSFER_LOOPS = ((1, "naive"), (2, "naive"), (4, "naive"), (6, "naive"), (2, "zero_extra"))
+_LEVELS = ("Empty (0 units)", "Low (1 to 3 units)", "Medium (4 to 6 units)", "High (7 or more units)")
+_TRANSFER_TASKS = {
+    "stock-eligibility": ("noul", ("yes", "no"), "After posted entries only, does the focus depot have at least five units?"),
+    "stock-level": ("score", ("0", "1", "2", "3"),
+                    "After posted entries only, rate the final stock of the focus depot using the ordered levels."),
+    "stock-choice": ("choice", tuple(f"option_{i}" for i in range(5)),
+                     "After posted entries only, which depot has the most units? "
+                     "If there is no unique maximum, choose No unique depot."),
+}
 
 
 def compact_recipe(name: str) -> dict:
@@ -63,6 +76,63 @@ def public_native_payload(row):
     return {"state": {}, "questions": {"q1": {"type": "choice", "instructions": row["prompt"], "criteria": criteria}}}
 
 
+def typed_transfer_payload(row: dict) -> dict:
+    """Validate a generic input without changing its digest; return only the native request."""
+    input_sha256(row)
+    if row["task"] not in _TRANSFER_TASKS:
+        raise ValueError("unknown typed-transfer task")
+    kind, labels, instructions = _TRANSFER_TASKS[row["task"]]
+    choices = row["choices"]
+    if kind == "noul":
+        if choices != ["Yes", "No"]:
+            raise ValueError("invalid eligibility menu")
+        criteria = {"true": "Yes", "false": "No"}
+    elif kind == "score":
+        if tuple(choices) != _LEVELS:
+            raise ValueError("invalid ordered stock levels")
+        criteria = list(choices)
+    else:
+        if len(choices) != len(labels) or choices.count("No unique depot") != 1:
+            raise ValueError("invalid depot menu")
+        criteria = dict(zip(labels, choices, strict=True))
+    return {"state": row["prompt"], "questions": {"audit": {"type": kind, "instructions": instructions, "criteria": criteria}}}
+
+
+def validate_transfer_answer(task: str, answer: dict, probs) -> None:
+    """Check public native decoding against the *unrounded*, ordered branch vector."""
+    def in_range(x, hi):
+        return type(x) in (int, float) and 0 <= x <= hi
+
+    def rounded(x, raw, hi):
+        # Half a unit in Joey's last public decimal, plus binary arithmetic at a tie.
+        return in_range(x, hi) and round(x, 6) == x and abs(x - raw) <= 0.5e-6 + 1e-14
+
+    if task not in _TRANSFER_TASKS:
+        raise ValueError("unknown typed-transfer task")
+    kind, labels, _ = _TRANSFER_TASKS[task]
+    width = len(labels)
+    if (not isinstance(probs, (tuple, list)) or len(probs) != width
+            or not all(in_range(p, 1) for p in probs) or abs(math.fsum(probs) - 1) > 1e-6):
+        raise ValueError("invalid transfer prediction")
+    fields = {"type", kind} if kind == "noul" else {"type", kind, "probabilities"}
+    if type(answer) is not dict or set(answer) != fields or answer["type"] != kind:
+        raise ValueError("invalid public transfer answer")
+    if kind == "noul":
+        if not rounded(answer["noul"], probs[0], 1):
+            raise ValueError("invalid native P(yes)")
+        return
+    values = answer["probabilities"]
+    if (type(values) is not dict or values.keys() != set(labels)
+            or not all(rounded(values[label], p, 1) for label, p in zip(labels, probs, strict=True))
+            or abs(math.fsum(values.values()) - 1) > 1e-5):
+        raise ValueError("invalid native transfer probability map")
+    if kind == "score":
+        if not rounded(answer["score"], math.fsum(i * p for i, p in enumerate(probs)), width - 1):
+            raise ValueError("invalid native expected level")
+    elif answer["choice"] not in labels:
+        raise ValueError("invalid declared native choice")
+
+
 def validate_native_answer(answer):
     if (type(answer) is not dict or set(answer) != {"type", "choice", "probabilities"}
             or answer["type"] != "choice" or answer["choice"] not in NATIVE_OPTIONS):
@@ -83,6 +153,12 @@ def _native_arm(window, plan, compact):
     return compact, plan.k, plan.method
 
 
+def _transfer_arm(window, plan, compact):
+    if tuple(window) != (8, 12) or plan.readout != "final" or (plan.k, plan.method) not in TRANSFER_LOOPS:
+        raise ValueError("outside the frozen typed-transfer comparison")
+    return compact, plan.k, plan.method
+
+
 def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
                    policy=None, split="discovery") -> tuple[dict, dict]:
     if split not in ("discovery", "selection", *PHASES):
@@ -96,11 +172,24 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
         _native_arm(window, plan, hasattr(native, "physical_to_source"))
         payload = public_native_payload(row)
         state, questions, qid = payload["state"], payload["questions"], "q1"
+        labels = NATIVE_OPTIONS
+    elif split == TRANSFER_MODE:
+        if reverse is not False or policy is not None:
+            raise ValueError("typed-transfer requires a single forward-order method")
+        compact = hasattr(native, "physical_to_source")
+        _transfer_arm(window, plan, compact)
+        if compact and tuple(native.physical_to_source) != SELECT20_LAYERS:
+            raise ValueError("typed-transfer requires the verified select-20 layers")
+        payload = typed_transfer_payload(row)
+        state, questions, qid = payload["state"], payload["questions"], "audit"
+        # Noul criteria keys and score descriptions are not the native slot labels.
+        labels = _TRANSFER_TASKS[row["task"]][1]
     else:
         state, questions = choice_request(row, order)
         qid = "decision"
+        labels = tuple(questions[qid]["criteria"])
     branch = native.branches(state, questions, window=window)[qid]
-    if tuple(branch.labels) != tuple(questions[qid]["criteria"]):
+    if tuple(branch.labels) != labels:
         raise ValueError("native option order differs from the request")
 
     def original_order(p):
@@ -120,6 +209,10 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
             answer = branch.decode(result.logits)
             validate_native_answer(answer)
             more["native_answer"] = answer
+        elif split == TRANSFER_MODE:
+            answer = branch.decode(result.logits)
+            validate_transfer_answer(row["task"], answer, p)
+            more["transfer_answer"] = answer
         trace = [{"block_evaluations": r.block_evaluations, "kind": r.kind,
                   "probs": original_order(branch.probabilities(r.logits))} for r in result.readouts]
     else:
@@ -281,16 +374,21 @@ def _nominated(obj, methods, envelope):
             raise ValueError("invalid nominated method ID")
         if obj["split"] != "refinement" and settings.get("compact_recipe") in REFINEMENT_RECIPES:
             raise ValueError("refinement-only recipe outside its authorized phase")
-        if obj["split"] == "public-native":
+        if obj["split"] in ("public-native", TRANSFER_MODE):
             window, plan = _settings(settings)
             compact = "compact_manifest_sha256" in settings
             if compact:
                 compact_pins.add(settings["compact_manifest_sha256"])
-            arm = _native_arm(window, plan, compact)
+            if obj["split"] == TRANSFER_MODE:
+                if set(settings["loop"]) - {"k", "method", "readout"}:
+                    raise ValueError("unused typed-transfer loop parameter")
+                arm = _transfer_arm(window, plan, compact)
+            else:
+                arm = _native_arm(window, plan, compact)
             if (settings["reverse"] or {"policy", "order_ensemble"} & settings.keys()
                     or (compact and settings.get("compact_recipe") != "select-20")
                     or arm in arms or len(compact_pins) > 1):
-                raise ValueError("outside the frozen public-native comparison")
+                raise ValueError(f"outside the frozen {obj['split']} comparison")
             arms.add(arm)
     declared = {k: v for k, v in obj.items() if k not in envelope}
     window, plan = _settings(declared)
@@ -414,6 +512,8 @@ def phase_rows(raw, view):
             # Hash the originals in their source order, never the reconstructed request.
             research.update(_upstream_line(row))
             native.update(_upstream_line(wrapper))
+        elif view["split"] == TRANSFER_MODE:
+            typed_transfer_payload(row)
         else:
             input_sha256(row)
         if len(rows) >= view["rows"] or row["id"] in seen or len(row["choices"]) > 255:
@@ -432,6 +532,8 @@ def phase_rows(raw, view):
 
 
 def _measure_ensemble(native, row, window, plan, split, *, second):
+    if split == TRANSFER_MODE:
+        raise ValueError("no order ensemble in typed-transfer")
     pred, trace = measure_choice(native, row, window, plan, split=split)
     if second:
         rev, other = measure_choice(native, row, window, plan, split=split, reverse=True)
@@ -445,6 +547,7 @@ def _measure_ensemble(native, row, window, plan, split, *, second):
 
 
 def run(args) -> None:
+    from . import transport
     if any(os.environ.get(k) != "1" for k in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")):
         raise ValueError("offline loader flags are required")
     selection = getattr(args, "selection", False)
@@ -453,10 +556,10 @@ def run(args) -> None:
     gate = None
     evidence_names = ("run_sha256", "view_sha256", "approval_sha256", "final_freeze_sha256")
     if phase is not None:
-        from . import transport
         if (selection or nomination_pin is not None or phase not in PHASES
                 or args.packet != transport.ADMISSION / "packet.json" or args.model_dir != transport.STAGED / "model"
                 or args.inputs != transport.STAGED / "inputs" / (phase + ".jsonl")
+                or (phase == TRANSFER_MODE and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
                 or args.compact_dir not in (None, transport.STAGED / "compact")):
             raise ValueError("wrong phase launch")
         gate = PhaseGate(phase, args.admit_before, args.hard_stop, args.packet_sha256, args.phase_permit_sha256,
@@ -465,7 +568,6 @@ def run(args) -> None:
     elif any(getattr(args, k, None) is not None for k in (*evidence_names, "phase_permit_sha256", "admit_before", "hard_stop")):
         raise ValueError("phase fields on a legacy launch")
     elif selection:
-        from . import transport
         if (not _pin(nomination_pin) or args.packet != transport.ADMISSION / "packet.json"
                 or args.inputs != transport.STAGED / "inputs/selection.jsonl"
                 or args.model_dir != transport.STAGED / "model"
@@ -475,6 +577,8 @@ def run(args) -> None:
     else:
         if nomination_pin is not None:
             raise ValueError("discovery cannot consume a nomination")
+        if getattr(args, "inputs", None) == transport.STAGED / "inputs" / (TRANSFER_MODE + ".jsonl"):
+            raise ValueError("transfer shard requires its phase gate")
         obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
     if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 30 * 3600:
         raise ValueError("expired or unbounded worker deadline")
@@ -495,7 +599,7 @@ def run(args) -> None:
         rows = [json.loads(s) for s in _load(args.inputs, obj["inputs_sha256"]).splitlines()]
     if not 0 < len(rows) <= 20000 or len({r["id"] for r in rows}) != len(rows):
         raise ValueError("invalid tier or duplicate decision IDs")
-    if phase != "public-native":  # phase_rows already proved the original q1 for every paired row.
+    if phase not in ("public-native", TRANSFER_MODE):  # phase_rows already checked every native request.
         for row in rows:
             choice_request(row, tuple(range(len(row["choices"]))))
     ensemble = obj.get("order_ensemble")

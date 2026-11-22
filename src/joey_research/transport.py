@@ -23,7 +23,7 @@ import sys
 import time
 from types import MappingProxyType
 
-from .worker import PHASES, PhaseGate
+from .worker import PHASES, SELECT20_LAYERS, TRANSFER_LOOPS, TRANSFER_MODE, PhaseGate
 
 HOST, PORT = "127.0.0.1", 18765
 WORK, STAGED, ADMISSION = Path("/work"), Path("/staged"), Path("/admission")
@@ -326,7 +326,7 @@ def _probe_child():
 
 
 def _completion_binding(metrics, attempt, jsonl_pins):
-    _require(metrics["packet_sha256"] == attempt.packet_sha256)
+    _require(type(metrics) is dict and "packet_sha256" in metrics and metrics["packet_sha256"] == attempt.packet_sha256)
     if attempt.permit_sha256 is not None:
         _require(metrics.get("split") == attempt.mode and metrics.get("permit_sha256") == attempt.permit_sha256
                  and _pin(metrics.get("method_sha256")) and _pin(metrics.get("inputs_sha256"))
@@ -337,8 +337,10 @@ def _completion_binding(metrics, attempt, jsonl_pins):
     phase = attempt.phase_gate().evidence() if attempt.mode in PHASES else {}
     for k in ("run_sha256", "view_sha256", "approval_sha256", "final_freeze_sha256"):
         _require(metrics.get(k) == phase[k] if k in phase else k not in metrics)
-    if attempt.mode == "public-native":
+    if attempt.mode in ("public-native", TRANSFER_MODE):
         _native_metrics(metrics)
+    if attempt.mode == TRANSFER_MODE:
+        _transfer_metrics(metrics)
 
 
 def _native_metrics(metrics):
@@ -351,12 +353,14 @@ def _native_metrics(metrics):
             "split", "inputs_sha256", "permit_sha256", "method_sha256", "result_sha256",
             "run_sha256", "view_sha256", "approval_sha256"}
     if "compact_manifest_sha256" in metrics:
-        from .native_compact import ReloadReport
         keys.update(("compact_manifest_sha256", "physical_layers", "reload_parity"))
+    _require(set(metrics) == keys and type(metrics["parity"]) is dict
+             and set(metrics["parity"]) == {f.name for f in fields(ParityReport)})
+    if "compact_manifest_sha256" in metrics:
+        from .native_compact import ReloadReport
         reload = metrics["reload_parity"]
-        _require(metrics["physical_layers"] == 20 and set(reload) == {f.name for f in fields(ReloadReport)}
+        _require(metrics["physical_layers"] == 20 and type(reload) is dict and set(reload) == {f.name for f in fields(ReloadReport)}
                  and reload["manifest_sha256"] == metrics["compact_manifest_sha256"])
-    _require(set(metrics) == keys and set(metrics["parity"]) == {f.name for f in fields(ParityReport)})
 
 
 def _native_trace(trace, packet_pin):
@@ -372,6 +376,111 @@ def _native_trace(trace, packet_pin):
     validate_native_answer(trace["native_answer"])
 
 
+def _number(value):
+    return type(value) in (float, int) and 0 <= value <= sys.float_info.max
+
+
+def _standard_metrics(metrics):
+    _require(_integer(metrics["schema"], 1, 1) and _integer(metrics["decisions"], 1, 20000)
+             and _integer(metrics["batch_size"], 1, 1) and metrics["hardware"] == "A100"
+             and type(metrics["parity"]) is dict and _integer(metrics["total_device_bytes"], 1, 2**52)
+             and all(_number(metrics[k]) and metrics[k] > 0 for k in (
+                 "warmup_load_and_parity_s", "wall_including_persistence_s", "decisions_per_wall_s"))
+             and set(metrics["warm_latency_ms"]) == {"50", "95", "99"})
+
+
+def _transfer_metrics(metrics):
+    _standard_metrics(metrics)
+    _require(all(_integer(metrics[k], 0, metrics["total_device_bytes"]) for k in (
+        "peak_allocated_bytes", "peak_reserved_bytes", "steady_allocated_bytes", "steady_reserved_bytes")))
+    _require(type(metrics["warm_latency_ms"]) is dict and all(map(_number, metrics["warm_latency_ms"].values())))
+    p = metrics["parity"]
+    _require(_encoded(p["window"]) == b"[8,12]" and _integer(p["branch_count"], 1, 20000)
+             and type(p["fork_modes"]) is list and 0 < len(p["fork_modes"]) <= p["branch_count"]
+             and all(m in ("sequential", "batched") for m in p["fork_modes"]) and p["same_top1"] is True)
+    for key, bound, limit in (("cached_max_abs_logit", "cached_logit_atol", .05),
+                              ("cached_max_abs_probability", "cached_probability_atol", .005),
+                              ("split_max_abs_logit", "split_atol", 1e-5),
+                              ("split_max_abs_probability", "split_atol", 1e-5)):
+        _require(_number(p[key]) and _number(p[bound]) and p[key] <= p[bound] <= limit)
+    if "compact_manifest_sha256" in metrics:
+        reload = metrics["reload_parity"]
+        _require(_pin(metrics["compact_manifest_sha256"]) and _integer(metrics["physical_layers"], 20, 20)
+                 and _encoded(reload["physical_to_source"]) == _encoded(SELECT20_LAYERS)
+                 and reload["same_top1"] is True and _integer(reload["branches"], 1, 20000)
+                 and all(_number(reload[k]) and reload[k] <= 1e-5 for k in ("max_abs_logit", "max_abs_probability")))
+
+
+def _transfer_calls(k, method):
+    _require((k, method) in TRANSFER_LOOPS)
+    return (1, 0, 0, 0) if k == 1 else (0, 1, 1 if method == "zero_extra" else k, 1)
+
+
+def _sealed_transfer_calls(metrics):
+    # Recovery has neither packet bytes nor staged inputs. Match the sealed *declared*
+    # method ID within this finite vocabulary, including omitted LoopPlan defaults.
+    base = {"window": [8, 12], "reverse": False}
+    if "compact_manifest_sha256" in metrics:
+        base.update(compact_recipe="select-20", compact_manifest_sha256=metrics["compact_manifest_sha256"])
+    for k, method in TRANSFER_LOOPS:
+        for passes in (({}, {"k": k}) if k == 1 else ({"k": k},)):
+            for rule in (({}, {"method": method}) if method == "naive" else ({"method": method},)):
+                for readout in ({}, {"readout": "final"}):
+                    if _sha(_encoded(dict(base, loop=passes | rule | readout))) == metrics["method_sha256"]:
+                        return _transfer_calls(k, method)
+    raise TransportError("unknown sealed transfer method")
+
+
+def _transfer_trace(trace, packet_pin, task, probs, depth, expected_calls):
+    from .native import TRAINED_BRANCH_LIMIT
+    from .worker import validate_transfer_answer
+    _require(type(trace) is dict and set(trace) == {"id", "tokens", "layer_calls", "callback_counts", "readouts",
+                                                    "wall_ms", "cuda_event_ms", "packet_sha256", "transfer_answer"}
+             and trace["packet_sha256"] == packet_pin and trace["readouts"] == []
+             and _integer(trace["tokens"], 1, TRAINED_BRANCH_LIMIT)
+             and all(_number(trace[k]) for k in ("wall_ms", "cuda_event_ms")))
+    counts = trace["callback_counts"]
+    keys = ("stock_calls", "prelude_calls", "block_calls", "coda_calls")
+    _require(type(counts) is dict and counts.keys() == set(keys) and all(type(n) is int for n in counts.values()))
+    calls = tuple(counts[k] for k in keys)
+    _require(calls == expected_calls)
+    layers = depth + 4 * (max(1, counts["block_calls"]) - 1)
+    _require(_integer(trace["layer_calls"], layers, layers))
+    validate_transfer_answer(task, trace["transfer_answer"], probs)
+
+
+def _transfer_streams(files, metrics, attempt, *, packet=None, rows=None):
+    """Export against the admitted rows/arm; recheck the sealed pair offline without opening a shard."""
+    pairs = zip(io.BytesIO(files["predictions.jsonl"]), io.BytesIO(files["trace.jsonl"]), strict=True)
+    expected = (_sealed_transfer_calls(metrics) if packet is None else
+                _transfer_calls(packet["loop"].get("k", 1), packet["loop"].get("method", "naive")))
+    depth = metrics.get("physical_layers", 24)
+    seen, times = set(), []
+    records = zip(rows.items(), pairs, strict=True) if rows is not None else ((None, pair) for pair in pairs)
+    for bound, (p, t) in records:
+        if rows is not None:
+            _remaining(attempt.compute_stop)
+        pred, trace = _json(p), _json(t)
+        _require(type(pred) is dict and set(pred) == {"id", "input_sha256", "probs"}
+                 and type(trace) is dict and type(pred["id"]) is str and pred["id"].strip()
+                 and trace.get("id") == pred["id"] and pred["id"] not in seen and len(seen) < metrics["decisions"]
+                 and _pin(pred["input_sha256"]) and type(pred["probs"]) is list)
+        width = len(pred["probs"])
+        if bound is not None:
+            key, row = bound
+            _require(pred["id"] == key and pred["input_sha256"] == row.digest and width == row.choices)
+            task = row.task
+        else:
+            # The collector has no input text or task column. These three widths are disjoint.
+            task = {2: "stock-eligibility", 4: "stock-level", 5: "stock-choice"}.get(width)
+        _transfer_trace(trace, attempt.packet_sha256, task, pred["probs"], depth, expected)
+        seen.add(pred["id"])
+        times.append(trace["wall_ms"])
+    _require(len(times) == metrics["decisions"])
+    times.sort()
+    _require(all(metrics["warm_latency_ms"][str(p)] == times[math.ceil(len(times) * p / 100) - 1] for p in (50, 95, 99)))
+
+
 def _outputs(run, packet, rows, attempt):
     from .worker import ensemble_groups
     with _directory("out", run) as out:
@@ -382,14 +491,12 @@ def _outputs(run, packet, rows, attempt):
                         if attempt.permit_sha256 is not None else None)
     if attempt.permit_sha256 is not None:
         _require(all(metrics[k] == packet[k] for k in ("split", "permit_sha256", "method_sha256", "inputs_sha256")))
-    _require(_integer(metrics["schema"], 1, 1)
-             and _integer(metrics["decisions"], len(rows), len(rows)) and _integer(metrics["batch_size"], 1, 1)
-             and metrics["hardware"] == "A100" and type(metrics["parity"]) is dict
-             and _integer(metrics["total_device_bytes"], 1, 2**52)
-             and all(type(metrics[k]) in (int, float) and math.isfinite(metrics[k]) and metrics[k] > 0
-                     for k in ("warmup_load_and_parity_s", "wall_including_persistence_s", "decisions_per_wall_s"))
-             and set(metrics["warm_latency_ms"]) == {"50", "95", "99"}
+    _require(metrics["decisions"] == len(rows)
              and metrics.get("compact_manifest_sha256") == packet.get("compact_manifest_sha256"))
+    if attempt.mode == TRANSFER_MODE:
+        _transfer_streams(files, metrics, attempt, packet=packet, rows=rows)
+        return files
+    _standard_metrics(metrics)
     ensemble = packet.get("order_ensemble")
     if ensemble is not None:
         selected = ensemble_groups(((r.task, r.group) for r in rows.values()), ensemble, split=attempt.mode)
@@ -403,7 +510,7 @@ def _outputs(run, packet, rows, attempt):
                  and len(pred["probs"]) == row.choices and all(type(x) in (float, int) and 0 <= x <= 1
                                                                for x in pred["probs"])
                  and abs(math.fsum(pred["probs"]) - 1) <= 1e-6
-                 and {"tokens", "layer_calls", "readouts", "wall_ms", "cuda_event_ms",
+                 and "transfer_answer" not in trace and {"tokens", "layer_calls", "readouts", "wall_ms", "cuda_event_ms",
                       "callback_counts"} <= set(trace))
         if attempt.permit_sha256 is not None:
             _require(trace.get("packet_sha256") == attempt.packet_sha256)
@@ -764,9 +871,12 @@ def _exchange(port, attempt, target, limit, *, ack=None):
 def _check_local(local, raw, doc, attempt, *, durable=False):
     _inventory(local, {"manifest.json", *doc["files"]})
     _require(_read(local, "manifest.json", 8192, durable=durable) == raw)
+    transfer = {}
     for name, record in doc["files"].items():
         data = _read(local, name, record["bytes"], durable=durable)
         _require(len(data) == record["bytes"] and _sha(data) == record["sha256"])
+        if attempt.mode == TRANSFER_MODE:
+            transfer[name] = data
         if name == "challenge.bin":
             _require(data == _challenge(attempt))
         elif name == "probe.json":
@@ -776,9 +886,15 @@ def _check_local(local, raw, doc, attempt, *, durable=False):
         elif name == "complete.json":
             _completion_binding(_json(data), attempt,
                                 {n: doc["files"][n]["sha256"] for n in ("predictions.jsonl", "trace.jsonl")})
-        elif name == "trace.jsonl" and attempt.mode == "public-native":
+        elif name == "trace.jsonl" and attempt.mode != TRANSFER_MODE:
             for line in io.BytesIO(data):
-                _native_trace(_json(line), attempt.packet_sha256)
+                trace = _json(line)
+                if attempt.mode == "public-native":
+                    _native_trace(trace, attempt.packet_sha256)
+                else:
+                    _require(type(trace) is dict and not {"transfer_answer", "native_answer"} & trace.keys())
+    if transfer:  # Failure and timeout publications have no files.
+        _transfer_streams(transfer, _json(transfer["complete.json"]), attempt)
 
 
 def _verified_bytes(port, attempt, destination, *, receipt_sha256=None):

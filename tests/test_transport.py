@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import unittest
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -76,14 +76,21 @@ class TransportTest(unittest.TestCase):
         (tr.ADMISSION / "packet.json").write_bytes(packet)
         return replace(a, mode="selection", permit_sha256=tr._sha(nom), packet_sha256=tr._sha(packet)), rows
 
-    def phase_attempt(self, mode, *, choices=None, view_changes=None, permit_changes=None, packet_changes=None):
+    def phase_attempt(self, mode, *, choices=None, rows=None, settings=None, view_changes=None, permit_changes=None, packet_changes=None):
         a = self.discovery()
-        settings = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
+        if settings is None:
+            settings = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
         mid = worker.method_sha256(settings)
         public = mode in ("public-development", "public-native")
-        choices = choices or ([f"synthetic option {i}" for i in range(77)] if public else ["A", "B"])
+        if choices is None:
+            choices = [f"synthetic option {i}" for i in range(77)] if public else ["A", "B"]
+            if mode == "typed-transfer":
+                choices = ["Yes", "No"]
         row = dict(self.row, id="toy-" + mode, prompt="Invented café case?", choices=choices)
-        shard = tr._encoded(row) + b"\n"
+        if mode == "typed-transfer":
+            row.update(task="stock-eligibility", prompt="Focus: Fern. Fern opens with 2 units; +4 posted, +1 pending.")
+        records = [row] if rows is None else rows
+        shard = b"".join(tr._encoded(r) + b"\n" for r in records)
         if mode == "public-native":
             q1 = {"type": "choice", "instructions": row["prompt"], "criteria": {f"option_{i}": s for i,s in enumerate(choices)}}
             wrapper = {"id": row["id"], "input_sha256": input_sha256(row), "payload": {"state": {}, "questions": {"q1": q1}}}
@@ -92,7 +99,7 @@ class TransportTest(unittest.TestCase):
             shard = line({"input": row, "native": wrapper})
         (tr.STAGED / "inputs" / (mode + ".jsonl")).write_bytes(shard)
         view = {"schema": "joey-label-free-view/v1", "split": mode, "projection": worker.PHASES[mode],
-                "inputs_sha256": tr._sha(shard), "split_manifest_sha256": "e"*64, "rows": 1, "bytes": len(shard)}
+                "inputs_sha256": tr._sha(shard), "split_manifest_sha256": "e"*64, "rows": len(records), "bytes": len(shard)}
         if public:
             view["menu_sha256"] = tr._sha(tr._encoded(choices))
         if mode == "public-native":
@@ -489,6 +496,196 @@ class TransportTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "launch"):
                 worker.run(args)
 
+    def test_transfer_refuses_replaced_bytes_wrong_targets_and_bad_rows_before_loading(self):
+        mode = "typed-transfer"
+        def arguments(a):
+            return SimpleNamespace(phase=mode, selection=False, nomination_sha256=None,
+                packet=tr.ADMISSION / "packet.json", inputs=tr.STAGED / "inputs/typed-transfer.jsonl",
+                model_dir=tr.STAGED / "model", output=tr.WORK / "run/out", compact_dir=None,
+                packet_sha256=a.packet_sha256, phase_permit_sha256=a.permit_sha256,
+                admit_before=a.admit_before, hard_stop=a.hard_stop, final_freeze_sha256=None, **a.phase_gate().evidence())
+        model_flags = {k: "1" for k in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_DATASETS_OFFLINE")}
+        with patch.dict(os.environ, model_flags, clear=True), patch.dict(sys.modules, torch=None):
+            self.assertEqual(tr._SHARDS[mode], "typed-transfer.jsonl")
+            for target in ("packet", "permit", "shard"):
+                a = self.phase_attempt(mode)
+                args = arguments(a)
+                _, _, _, rows = tr._phase_inputs(a.phase_gate())  # Parent accepted the original, not the replacement.
+                path = {"packet": args.packet, "permit": tr.ADMISSION / (mode + "-permit.json"), "shard": args.inputs}[target]
+                path.write_bytes(path.read_bytes() + b" ")
+                with self.subTest(replaced=target), self.assertRaises(ValueError):
+                    worker.run(args)
+            a = self.phase_attempt(mode)
+            for change in ({"inputs": tr.STAGED / "inputs/discovery.jsonl"}, {"packet": tr.ADMISSION / "other"},
+                           {"output": tr.WORK / "other"}, {"model_dir": self.root}, {"compact_dir": tr.STAGED / "compact"},
+                           {"selection": True}, {"nomination_sha256": "0"*64}, {"phase": None}, {"phase": "refinement"},
+                           {"hard_stop": a.hard_stop + 1}, {"admit_before": a.admit_before - 1},
+                           {"run_sha256": "0"*64}, {"approval_sha256": "0"*64}, {"view_sha256": "0"*64}):
+                with self.subTest(change=change), self.assertRaises(ValueError):
+                    worker.run(SimpleNamespace(**(vars(arguments(a)) | change)))
+            for other in ("public-native", "calibration", "refinement", "final"):
+                # Even with the right hashes and a role-appropriate release, the documents are role-specific.
+                gate = replace(a.phase_gate(), mode=other, **(
+                    {"final_freeze_sha256": a.approval_sha256, "approval_sha256": None} if other == "final" else {}))
+                with self.assertRaises(ValueError):
+                    worker.phase_packet(tr._packet_bytes(), tr._admission_bytes(mode + "-permit.json"), gate)
+            for extra in ("menu_sha256", "native_requests_sha256", "criteria", "tasks"):
+                a = self.phase_attempt(mode, view_changes={extra: "e"*64})
+                with self.assertRaises(ValueError):
+                    tr._phase_inputs(a.phase_gate())
+            valid, = rows
+            for change in ({"task": "unknown"}, {"answer": 0}, {"native": {}}, {"prompt": {}}, {"choices": ["No", "Yes"]},
+                           {"task": "stock-level", "choices": ["0", "1", "2", "3"]},
+                           {"task": "stock-choice", "choices": ["A", "B", "C", "D", "E"]},
+                           {"task": "stock-choice", "choices": ["A", "B", "C", "No unique depot"]},
+                           {"task": "stock-choice", "choices": ["A", "B", "C", "C ", "No unique depot"]}):
+                a = self.phase_attempt(mode, rows=[valid, dict(valid, **change, id="second")])
+                with self.subTest(change=change):
+                    with self.assertRaises(ValueError):
+                        tr._phase_inputs(a.phase_gate())
+                    with self.assertRaises(ValueError):
+                        worker.run(arguments(a))
+
+    def transfer_fixture(self):
+        """In-process native callbacks -> real loop -> export files. No child, runtime install or listener."""
+        from joey_research.native import ParityReport
+        from joey_research.native_compact import ReloadReport
+        choices = ["Mauve", "Fern", "No unique depot", "Teal", "Lime"]
+        levels = ["Empty (0 units)", "Low (1 to 3 units)", "Medium (4 to 6 units)", "High (7 or more units)"]
+        states = ("Focus: Fern. Opening units: Fern 1, Mauve 2, Lime 3, Teal 1. Fern +7 posted; Teal +2 pending.",
+                  "Focus: Lime. Opening units: Fern 6, Mauve 4, Lime 2, Teal 7. Lime −1 posted; Mauve +3 posted.")
+        rows = [dict(id=f"{i}:{task}", group_id=f"toy:{i}", prompt=prompt, task=task, choices=menu)
+                for i, prompt in enumerate(states)
+                for task, menu in (("stock-eligibility", ["Yes", "No"]), ("stock-level", levels),
+                                   ("stock-choice", choices if i else choices[::-1]))]
+        settings = {"window": [8, 12], "loop": {"k": 4}, "reverse": False,
+                    "compact_recipe": "select-20", "compact_manifest_sha256": "9"*64}
+        a = self.phase_attempt("typed-transfer", rows=rows, settings=settings)
+        packet, window, plan, admitted = tr._phase_inputs(a.phase_gate())
+        self.assertEqual(admitted, rows)
+        kept = (*range(12), *range(16, 24))
+        def branches(state, qs, *, window):
+            kind = qs["audit"]["type"]
+            labels, p = {"noul": (("yes", "no"), (.12345671, .87654329)),
+                         "score": (("0", "1", "2", "3"), (.33333349, .33333349, .33333302, 0.)),
+                         "choice": (tuple(f"option_{i}" for i in range(5)), (.49999971, .2, .2, .1, .00000029))}[kind]
+            public = {"type": kind}
+            if kind == "noul":
+                public[kind] = round(p[0], 6)
+            else:
+                public[kind] = "option_3" if kind == "choice" else round(sum(i*v for i, v in enumerate(p)), 6)
+                public["probabilities"] = {k: round(v, 6) for k, v in zip(labels, p, strict=True)}
+            return {"audit": SimpleNamespace(labels=labels, layout=SimpleNamespace(input_ids=(1, 2)),
+                inference_context=contextlib.nullcontext, prelude=lambda: 0, block=lambda h, s: h+1, coda=lambda h, s: h,
+                fresh_state=object, probabilities=lambda z: p, decode=lambda z: public)}
+        native = SimpleNamespace(branches=branches, physical_to_source=kept)
+        predictions, traces = [], []
+        for i, r in enumerate(admitted):
+            p, t = worker.measure_choice(native, r, window, plan, split=a.mode)
+            predictions.append(p)
+            traces.append(dict(t, packet_sha256=a.packet_sha256, wall_ms=i+1, cuda_event_ms=0.25))
+        bound = {r["id"]: tr._Decision(input_sha256(r), len(r["choices"]), r["task"], r["group_id"]) for r in admitted}
+        metrics = dict(json.loads(self.worker_files(a, rows[0])["complete.json"]), decisions=len(bound),
+            split=a.mode, inputs_sha256=packet["inputs_sha256"], permit_sha256=a.permit_sha256,
+            method_sha256=packet["method_sha256"], warm_latency_ms={"50": 3, "95": 6, "99": 6},
+            parity=asdict(ParityReport(window, 5, ("sequential", "sequential"), 0., 0., 0., 0., True, .05, .005, 1e-5)),
+            physical_layers=20, compact_manifest_sha256=settings["compact_manifest_sha256"],
+            reload_parity=asdict(ReloadReport(settings["compact_manifest_sha256"], kept, 5, 0., 0., True)),
+            **{k: 1 for k in ("peak_allocated_bytes", "peak_reserved_bytes", "steady_allocated_bytes", "steady_reserved_bytes")},
+            **a.phase_gate().evidence())
+        (tr.WORK / "out").mkdir()
+        return a, packet, bound, predictions, traces, metrics
+
+    @staticmethod
+    def sealed_outputs(predictions, traces, metrics):
+        files = {name: b"".join(tr._encoded(row) + b"\n" for row in rows) for name, rows in (
+            ("predictions.jsonl", predictions), ("trace.jsonl", traces))}
+        files["complete.json"] = tr._encoded(dict(metrics, result_sha256={n: tr._sha(data) for n, data in files.items()}))
+        for name, data in files.items():
+            (tr.WORK / "out" / name).write_bytes(data)
+        return files
+
+    def test_transfer_export_collection_and_offline_recovery_without_sockets(self):
+        a, packet, bound, preds, traces, metrics = self.transfer_fixture()
+        self.assertEqual([t["transfer_answer"]["type"] for t in traces], ["noul", "score", "choice"]*2)
+        self.assertEqual([t["transfer_answer"]["choice"] for t in traces if t["transfer_answer"]["type"] == "choice"],
+                         ["option_3", "option_3"])
+        self.assertTrue(all(t["layer_calls"] == 32 and t["callback_counts"]["block_calls"] == 4 for t in traces))
+        files = self.sealed_outputs(preds, traces, metrics)
+        with tr._directory(tr.WORK) as run:
+            self.assertEqual(tr._outputs(run, packet, bound, a), files)
+        routes = tr._publication(a, "complete", files)
+        dest = self.root / "collected"
+        def exchange(port, attempt, target, limit, **kw):
+            if target == "/ack":
+                self.assertEqual(json.loads(kw["ack"])["receipt_sha256"], tr._sha((dest / "manifest.json").read_bytes()))
+                raise ConnectionError("invented ACK loss")
+            return routes[target.encode()][0]
+        with patch.object(tr, "_exchange", side_effect=exchange):
+            pin = tr.pin_receipt(1, a)
+            with self.assertRaises(tr.TransportError):
+                tr.collect(1, dest, **asdict(a), receipt_sha256=pin)
+        with patch.object(tr, "_exchange", side_effect=AssertionError), patch.object(time, "time", return_value=a.hard_stop + 1):
+            self.assertEqual(tr.recover(dest, attempt=a, receipt_sha256=pin)["status"], "complete")
+            self.assertEqual({p.name for p in dest.iterdir()}, {"manifest.json", "complete.json", "predictions.jsonl", "trace.jsonl"})
+            for wrong in (replace(a, mode="calibration"), replace(a, view_sha256="0"*64), replace(a, hard_stop=a.hard_stop+1)):
+                with self.assertRaises(tr.TransportError):
+                    tr.recover(dest, attempt=wrong, receipt_sha256=pin)
+            (dest / "trace.jsonl").write_bytes(files["trace.jsonl"] + b"\n")
+            with self.assertRaises(tr.TransportError):
+                tr.recover(dest, attempt=a, receipt_sha256=pin)
+
+    def test_transfer_resealed_outputs_still_need_the_right_primitive_vector_and_cost(self):
+        a, packet, bound, preds, traces, metrics = self.transfer_fixture()
+        with tr._directory(tr.WORK) as run:
+            def refused(p=preds, t=traces, m=metrics, rows=bound):
+                self.sealed_outputs(p, t, m)
+                with self.assertRaises(ValueError):
+                    tr._outputs(run, packet, rows, a)
+            n, s, c = (t["transfer_answer"] for t in traces[:3])
+            for i, changes in (
+                (0, {"request": "text"}), (0, {"native_answer": n}), (0, {"transfer_answer": s}),
+                (0, {"transfer_answer": dict(n, probabilities={"yes": 1})}), (0, {"transfer_answer": dict(n, noul=True)}),
+                (0, {"transfer_answer": dict(n, noul=.123456)}),  # Within 1e-5 but outside rounding allowance.
+                (1, {"transfer_answer": dict(s, score=2)}), (1, {"transfer_answer": dict(s, probabilities={"Low": 1})}),
+                (2, {"transfer_answer": dict(c, choice="Mauve")}), (2, {"transfer_answer": dict(c, debug="prompt")}),
+                (2, {"transfer_answer": dict(c, probabilities=dict(c["probabilities"], option_0=.4, option_4=.1))}),
+                (0, {"tokens": True}), (0, {"tokens": 16385}), (1, {"wall_ms": -1}), (2, {"cuda_event_ms": "slow"}),
+                (0, {"layer_calls": 36}), (1, {"callback_counts": dict(traces[1]["callback_counts"], coda_calls=True)}),
+                (0, {"layer_calls": 24, "callback_counts": dict(traces[0]["callback_counts"], block_calls=2)}),
+                (0, {"packet_sha256": "0"*64}), (0, {"readouts": [0]}),
+            ):
+                with self.subTest(index=i, fields=changes):
+                    refused(t=[*traces[:i], dict(traces[i], **changes), *traces[i+1:]])
+            for changes in ({"probs": [.1, .8]}, {"probs": [True, False]}, {"probs": [-1, 2]}, {"probs": [.5, .3, .2]},
+                            {"input_sha256": "0"*64}, {"prompt": "text"}):
+                with self.subTest(pred=changes):
+                    refused(p=[dict(preds[0], **changes), *preds[1:]])
+            key = preds[0]["id"]
+            refused(rows=bound | {key: replace(bound[key], task="stock-choice")})
+            for changes in ({"split": "public-native"}, {"note": "raw request"}, {"warm_latency_ms": {"50": 4, "95": 6, "99": 6}},
+                            {"parity": dict(metrics["parity"], fork_modes=["text"])}, {"physical_layers": 24},
+                            {"reload_parity": dict(metrics["reload_parity"], physical_to_source=list(range(20)))}):
+                with self.subTest(metrics=changes):
+                    refused(m=dict(metrics, **changes))
+            wrong_budget = [dict(t, callback_counts=dict(t["callback_counts"], block_calls=2), layer_calls=24) for t in traces]
+            for wrong_traces in ([dict(traces[0], native_answer=n), *traces[1:]], wrong_budget):
+                files = self.sealed_outputs(preds, wrong_traces, metrics)
+                routes = tr._publication(a, "complete", files)
+                with patch.object(tr, "_exchange", side_effect=lambda p, att, target, lim: routes[target.encode()][0]) as get:
+                    with self.assertRaises(tr.TransportError):
+                        tr.collect(1, self.root / "rejected", **asdict(a), receipt_sha256=routes[b"/manifest"][1])
+                    self.assertNotIn("/ack", [call.args[2] for call in get.call_args_list])
+            # A legacy envelope must not acquire a new nested answer channel either.
+            old = self.discovery()
+            old_packet, old_rows = tr._discovery(old)
+            legacy = self.worker_files(old, self.row)
+            legacy["trace.jsonl"] = tr._encoded(dict(json.loads(legacy["trace.jsonl"]), transfer_answer=n)) + b"\n"
+            for name, data in legacy.items():
+                (tr.WORK / "out" / name).write_bytes(data)
+            with self.assertRaises(ValueError):
+                tr._outputs(run, old_packet, old_rows, old)
+
     def test_public_native_pairs_bind_inner_byte_streams_and_ordered_q1(self):
         a = self.phase_attempt("public-native")
         raw = tr._shard_bytes(a.mode)
@@ -553,7 +750,7 @@ class TransportTest(unittest.TestCase):
         events = []
         def branches(state, qs, *, window):
             qid, = qs
-            labels = tuple(qs[qid]["criteria"])
+            labels = ("yes", "no") if qid == "audit" else tuple(qs[qid]["criteria"])
             observations.append(len(labels))
             if qid == "q1":
                 self.assertEqual(state, {})
@@ -567,6 +764,8 @@ class TransportTest(unittest.TestCase):
             def decode(arg):
                 self.assertIs(arg, logits)
                 events.append("decode")
+                if qid == "audit":
+                    return {"type": "noul", "noul": 0.5}
                 # Deliberately not the first argmax; native output need not be the research vector.
                 return {"type": "choice", "choice": labels[-1], "probabilities": dict.fromkeys(labels, 0.013)}
             return {qid: SimpleNamespace(labels=labels, layout=SimpleNamespace(input_ids=(1,)),
@@ -622,6 +821,9 @@ class TransportTest(unittest.TestCase):
                                     tr._outputs(run, packet, bound, a)
                         (out / "trace.jsonl").write_bytes(files["trace.jsonl"])
                         (out / "complete.json").write_bytes(files["complete.json"])
+                    elif mode == "typed-transfer":
+                        self.assertEqual(json.loads(files["trace.jsonl"])["transfer_answer"], {"type": "noul", "noul": 0.5})
+                        self.assertEqual(events, ["forward", "vector", "decode"])
                     else:
                         self.assertEqual(events, ["forward", "vector"])
                         self.assertNotIn("native_answer", json.loads(files["trace.jsonl"]))
