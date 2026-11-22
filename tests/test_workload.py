@@ -61,3 +61,15 @@ class WorkloadTest(unittest.TestCase):
             self.assertEqual(obj["metadata"]["labels"]["research.run/id"],shared.run_label)
         self.fields["deadline_utc"]=101
         with self.assertRaises(AdmissionError):self.compile()
+
+    def test_pull_secret_and_ordinary_priority_are_bound_not_mutations(self):
+        target=replace(self.target,image_pull_secret=("study-pull","uid-one"),ordinary_priority_proof="6"*64)
+        for kwargs in ({"pull_secret_uid":"wrong","scheduling_proof":"6"*64},
+                       {"pull_secret_uid":"uid-one","scheduling_proof":"7"*64}):
+            with self.assertRaises(AdmissionError):self.compile(target=target,**kwargs)
+        _,job=self.compile(target=target,pull_secret_uid="uid-one",scheduling_proof="6"*64)
+        pod=job["spec"]["template"]["spec"]
+        self.assertEqual(pod["imagePullSecrets"],[{"name":"study-pull"}])
+        self.assertNotIn("serviceAccountName",pod)
+        self.assertNotIn("preemptionPolicy",pod)
+        self.assertNotIn("priorityClassName",pod)

@@ -43,6 +43,8 @@ class BoundTarget:
     # Each item is the exact optional accelerator taint (key, value, effect) on that slot.
     taints: tuple[tuple[str, str, str] | None, tuple[str, str, str] | None]
     shared_approval_sha256: str | None = None
+    image_pull_secret: tuple[str, str] | None = None  # An approved reference and UID, never credential data.
+    ordinary_priority_proof: str | None = None
 
     def __post_init__(self):
         _require(_dns(self.namespace) and not self.namespace.startswith("kube-") and
@@ -50,6 +52,12 @@ class BoundTarget:
                  "verified namespace selection required")
         _require(self.namespace_uid and _dns(self.run_label) and _dns(self.pool), "invalid local scope")
         _require(_dns(self.result_claim) and self.result_claim_uid, "preverified existing private output volume required")
+        if self.image_pull_secret is not None:
+            _require(isinstance(self.image_pull_secret,tuple) and len(self.image_pull_secret)==2
+                     and _dns(self.image_pull_secret[0]) and isinstance(self.image_pull_secret[1],str)
+                     and bool(self.image_pull_secret[1]), "invalid approved image-pull reference")
+        if self.ordinary_priority_proof is not None:
+            _require(_sha(self.ordinary_priority_proof), "ordinary priority requires a verified victim-free admission receipt")
         _require(isinstance(self.hosts, tuple) and len(self.hosts) == 2 and len(set(self.hosts)) == 2 and
                  all(_dns(h) for h in self.hosts), "two distinct verified pool hosts required")
         _require(isinstance(self.registry, str) and "." in self.registry and len(self.registry) < 254 and
@@ -68,12 +76,16 @@ class BoundTarget:
 
 def compile_discovery(target: BoundTarget, ticket: Admission, packet: bytes, *, now: int,
                       expected_run: str, namespace_uid: str, claim_uid: str, manifest_digest: str,
-                      packet_digest: str, split_digest: str, namespace_approval_digest: str | None = None) -> tuple[dict, dict]:
+                      packet_digest: str, split_digest: str, namespace_approval_digest: str | None = None,
+                      pull_secret_uid: str | None = None, scheduling_proof: str | None = None) -> tuple[dict, dict]:
     """Build a single packet ConfigMap + Job. Verification of mirror, RBAC, custody and exclusivity precedes this."""
     _require(type(ticket) is Admission and type(now) is int and ticket.split is Split.DEV, "discovery admission required")
     _require(target.namespace_uid == namespace_uid and ticket.run_id == expected_run and _sha(expected_run),
              "project target or run changed")
     _require(target.shared_approval_sha256 == namespace_approval_digest, "namespace approval differs from bound target")
+    _require(pull_secret_uid == (target.image_pull_secret[1] if target.image_pull_secret else None),
+             "approved pull reference changed")
+    _require(target.ordinary_priority_proof == scheduling_proof, "scheduling evidence changed")
     _require(claim_uid == target.result_claim_uid, "durable output identity changed")
     _require(_sha(manifest_digest) and ticket.manifest_sha == manifest_digest and _sha(ticket.trial_id) and _sha(ticket.token),
              "manifest or ticket hash mismatch")
@@ -129,6 +141,13 @@ def compile_discovery(target: BoundTarget, ticket: Admission, packet: bytes, *, 
     if target.taints[ticket.slot]:
         key,value,effect=target.taints[ticket.slot]
         pod["tolerations"]=[{"key":key,"operator":"Equal","value":value,"effect":effect}]
+    if target.image_pull_secret:
+        pod["imagePullSecrets"]=[{"name":target.image_pull_secret[0]}]
+    if target.ordinary_priority_proof:
+        # Some admission controllers require the preemption policy to come from
+        # the PriorityClass. The caller must recheck priority zero and no lower
+        # priority victims on the selected nodes immediately before creation.
+        del pod["preemptionPolicy"]
     job = {"apiVersion":"batch/v1","kind":"Job","metadata":metadata(name),
            "spec":{"backoffLimit":0,"parallelism":1,"completions":1,"activeDeadlineSeconds":ticket.hard_stop-now,
                    "template":{"metadata":{"labels":dict(labels),"annotations":dict(annotations)},"spec":pod}}}
