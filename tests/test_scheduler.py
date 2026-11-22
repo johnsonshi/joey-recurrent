@@ -145,6 +145,34 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             self.q.register(manifest("no-test-retry", split=Split.TEST), max_attempts=2)
 
+    def test_native_measurement_needs_real_staging_but_not_a_fabricated_parity_gate(self):
+        import json
+        from joey_research.scheduler import _hash
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as d:
+            q=Queue.create(Path(d)/"native.sqlite",run_id=RUN,start_utc=START,
+                           gpu_classes=("A100-loop","A100-compact"),clock=self.clock)
+            try:
+                def register(k):
+                    settings={"family":"additive","loop":{"k":k,"method":"naive"},"window":[8,12]}
+                    payload=(json.dumps({"mode":"screen","split":"discovery","branch":"loop","settings":settings},
+                                        separators=(",",":"),sort_keys=True)+"\n").encode()
+                    m=manifest("native"+str(k),gpu="A100-loop")
+                    m=replace(m,key=replace(m.key,config=_hash(settings)),sha256=hashlib.sha256(payload).hexdigest())
+                    return q.register(m),payload
+                native,payload=register(1)
+                other,recurrent=register(2)
+                self.assertIsNone(q.reserve_native_control(native,payload))
+                for tid in (native,other):q.attest(tid,Gate.OFFLINE_STAGING,digest("actual-stage"))
+                self.assertIsNone(q.reserve())
+                with self.assertRaises(PolicyError):q.reserve_native_control(other,recurrent)
+                with self.assertRaises(PolicyError):q.reserve_native_control(other,payload)
+                t=q.reserve_native_control(native,payload)
+                self.assertEqual((t.slot,t.trial_id),(0,native))
+                self.assertIsNone(q.reserve_native_control(native,payload))
+                self.assertEqual(q.status()["gpu_budget"]["reserved_s"],120)
+                self.assertIsNone(next(r for r in q.registry() if r["id"]==native)["parity_sha"])
+            finally:q.close()
+
     def test_gates_dependency_and_gpu_class_are_independent(self):
         parent = self.add(manifest("prerequisite"), ready=False, priority=100)
         child = self.add(manifest("child"), requires=[parent], priority=0)

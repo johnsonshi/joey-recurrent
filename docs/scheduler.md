@@ -25,6 +25,8 @@ Before the freeze, the coordinator may call `q.extend_once(hours=n, evidence_sha
 
 ## GPU time is a separate ceiling
 
+Before a parity proof exists, `reserve_native_control(trial_id, proposal_bytes)` can fund the measurement itself. It accepts only a registered, offline-staged, one-pass stock or physically compact discovery control whose immutable proposal and configuration hashes match. It uses the same exclusive slots, reservation ledger and dev cutoff as ordinary trials. No `stock_parity` receipt is synthesized; the coordinator must independently verify the real output before attesting any later candidate. Held-out cases and extra passes cannot use this entry point.
+
 **Exactly two one-A100 slots share 48 GPU-hours (`GPU_CAP_S=172800` GPU-seconds), not 52.** If setup or earlier work already consumed part of this ceiling, pass that conservative debit in `Queue.create(..., prior_gpu_s=...)` (0–172800; default 0). This reduces available GPU time without backdating the experimental clock. Use this queue for every subsequent chargeable attempt; it does not meter other launch paths. `q.status()["gpu_budget"]` (also in `q.snapshot()["status"]`) exposes:
 
 | Field | Meaning in GPU-seconds |

@@ -696,19 +696,64 @@ class Queue:
 
     def reserve(self) -> Admission | None:
         """Durably consume one admission before I/O; only its reserving caller may send it."""
+        return self._reserve()
+
+    def reserve_native_control(self, trial_id: str, proposal: bytes) -> Admission | None:
+        """Acquire a slot to *measure* missing one-pass parity, never attest it in advance.
+
+        This route is dev-only and checks the actual registered proposal bytes;
+        a recurrent candidate cannot opt into the bootstrap gate by changing a label.
+        All ordinary slot, budget, once-only and cutoff checks still apply.
+        """
+        _digest(trial_id)
+        if not isinstance(proposal, bytes) or len(proposal) > 16384:
+            raise PolicyError("invalid native control proposal")
+        try:
+            d = json.loads(proposal)
+            settings = d["settings"]
+            if d["branch"] == "loop":
+                valid = (set(settings) == {"family", "loop", "window"} and settings["family"] == "additive"
+                         and settings["loop"] == {"k": 1, "method": "naive"} and type(settings["loop"]["k"]) is int
+                         and len(settings["window"]) == 2 and all(type(i) is int for i in settings["window"])
+                         and 0 <= settings["window"][0] < settings["window"][1] < 24)
+            else:
+                valid = (d["branch"] == "compact" and set(settings) == {"family", "plan", "plan_sha256", "k"}
+                         and settings["family"] == "compact" and settings["plan"] in ("select-20", "select-16", "merge-16")
+                         and _digest(settings["plan_sha256"]) and type(settings["k"]) is int and settings["k"] == 1)
+            valid = (valid and d["mode"] == "screen" and d["split"] == "discovery"
+                     and proposal == (_json(d)+"\n").encode("ascii"))
+        except (ValueError, TypeError, KeyError, IndexError):
+            raise PolicyError("unrecognized native control") from None
+        if not valid:
+            raise PolicyError("not an exact one-pass discovery control")
+        return self._reserve((trial_id, hashlib.sha256(proposal).hexdigest(), _hash(settings), "A100-"+d["branch"]))
+
+    def _reserve(self, control: tuple[str, str, str, str] | None = None) -> Admission | None:
         with self._transaction() as now:
             if now >= self.finalize_at:
                 return None
             split, cutoff = (Split.DEV, self.freeze_at) if now < self.freeze_at else (Split.TEST, self.finalize_at)
+            if control and split != Split.DEV:
+                raise PolicyError("native parity acquisition ends at the development freeze")
+            gate = "AND (SELECT COUNT(*) FROM gates g WHERE g.trial_id=t.id)=2 "
+            extra = ()
+            if control:
+                member = self._trial(control[0])
+                if (member["split"] != Split.DEV or member["manifest_sha"] != control[1] or
+                        json.loads(member["key_json"])["config"] != control[2] or member["gpu_class"] != control[3]):
+                    raise PolicyError("native control registration does not match")
+                gate = ("AND t.id=? AND EXISTS(SELECT 1 FROM gates g WHERE g.trial_id=t.id AND g.kind='offline_staging') "
+                        "AND NOT EXISTS(SELECT 1 FROM gates g WHERE g.trial_id=t.id AND g.kind='stock_parity') ")
+                extra = (control[0],)
             available = min(cutoff - now, self._gpu_budget()["remaining_s"])
             row = self._db.execute(
                 "SELECT t.*,s.slot FROM trials t JOIN slots s ON s.gpu_class=t.gpu_class "
                 "WHERE t.split=? AND t.state='queued' AND t.budget_s<=? "
                 "AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.slot=s.slot AND a.state!='closed') "
-                "AND (SELECT COUNT(*) FROM gates g WHERE g.trial_id=t.id)=2 "
+                + gate +
                 "AND NOT EXISTS(SELECT 1 FROM dependencies d JOIN trials p ON p.id=d.parent "
                 "               WHERE d.trial_id=t.id AND p.state!='succeeded') "
-                "ORDER BY t.priority,t.id,s.slot LIMIT 1", (split.value, available)).fetchone()
+                "ORDER BY t.priority,t.id,s.slot LIMIT 1", (split.value, available, *extra)).fetchone()
             if row is None:
                 return None
             slot, tid = row["slot"], row["id"]
@@ -726,6 +771,8 @@ class Queue:
                               admit_before, stop, admit_before))
             self._db.execute("UPDATE trials SET state='active' WHERE id=?", (tid,))
             detail = {"slot": slot, "generation": generation, "admit_before": admit_before, "hard_stop": stop}
+            if control:
+                detail["purpose"] = "measure-native-one-pass-parity"
             if deadline != self.nominal_deadline:
                 detail["run_deadline"] = deadline
             self._event(now, "reserved", tid, token, detail)
