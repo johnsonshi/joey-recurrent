@@ -1,0 +1,31 @@
+{
+  "schema": "joey-native-inventory-development/v1",
+  "scope": "Secondary development-only transfer study. Tests the frozen-weight depth effect outside graph routing and 77-intent classification. Does not replace or select any confirmatory method.",
+  "seeds": [81403, 94217],
+  "groups_per_task_difficulty_per_seed": 96,
+  "tasks": ["stock-eligibility", "stock-level", "stock-choice"],
+  "ledger_lengths": [2, 6, 12],
+  "renderings_per_group": 2,
+  "input_order": "Sort by SHA256 of UTF-8 'inventory-order-v1:' plus the opaque row ID, tie break by ID. Across every method use exactly the same order.",
+  "models": ["full", "select-20"],
+  "native_methods": [
+    {"method": "naive", "k": 1},
+    {"method": "zero_extra", "k": 2},
+    {"method": "naive", "k": 2},
+    {"method": "naive", "k": 4},
+    {"method": "naive", "k": 6}
+  ],
+  "window": [8, 12],
+  "hardware": "Reverse the previous physical lane assignment for this entire view. Measure independent one-pass parity on both newly assigned slots before recurrent comparisons. Compare costs within each payload; swapping nodes across datasets alone cannot identify a hardware effect.",
+  "analysis": {
+    "primary": "Compare two-pass naive to one ordinary pass in each payload and each native task. Compare to the same-payload zero-extra implementation for measured cost. Deeper endpoints are secondary sensitivity measures.",
+    "full_precision": "Report argmax accuracy, summed Brier, NLL, ECE15, risk-coverage, and confident error counts on the full legal distribution per task.",
+    "native": "Report qev typed choice accuracy, binary p_yes accuracy at >=0.5 plus binary Brier and log loss, and the ordinal expected-score MAE, RMSE and ranked probability score on the ordered scale 0 through 3. Do not reinterpret the native ordinal expectation as a declared categorical choice.",
+    "paired_nuisance": "Within a group report top-answer agreement in canonical answer semantics across the two state/menu renderings. Keep ties, native ambiguity and seed/difficulty supports visible.",
+    "statistics": {"unit": "complete inventory group", "stratify": ["task", "seed", "ledger_length"], "bootstrap_reps": 2000, "seed": 4117},
+    "confidence_thresholds": [0.8, 0.9, 0.95, 0.99]
+  },
+  "affects_final_nomination_or_temperature": false,
+  "official_score": false,
+  "capacity": {"attempt_seconds": 2700, "stage_ceiling_gpu_seconds": 28800, "protected_final_gpu_seconds": 12600}
+}

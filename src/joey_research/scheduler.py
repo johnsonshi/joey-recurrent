@@ -873,6 +873,35 @@ class Queue:
             raise PolicyError("not an exact new-payload development control")
         return self._reserve((trial_id, hashlib.sha256(proposal).hexdigest(), k.config, "A100-compact"))
 
+    def reserve_transfer_anchor(self, trial_id: str, proposal: bytes) -> Admission | None:
+        """Measure the same payload's actual one-pass parity on its newly assigned A100."""
+        from .native import MODEL_SHA256
+        from .worker import method_sha256
+
+        _digest(trial_id)
+        if type(proposal) is not bytes or not 0 < len(proposal) <= 16384:
+            raise PolicyError("invalid transfer control proposal")
+        try:
+            d = json.loads(proposal)
+            k, m = TrialKey(**d["key"]), d["settings"]
+            small = "compact_recipe" in m
+            slot = 0 if small else 1
+            fields = {"window", "loop", "reverse"} | ({"compact_recipe", "compact_manifest_sha256"} if small else set())
+            valid = (d["schema"] == "joey-typed-transfer-trial/v1" and d["mode"] == "typed-transfer"
+                     and d["run_id"] == self.run_id and d["payload"] == ("select-20" if small else "full")
+                     and type(d["slot"]) is int and d["slot"] == slot and d["anchor_trial"] is None
+                     and proposal == _json(d).encode("ascii") and set(m) == fields
+                     and k.trial_id == trial_id == d["trial_id"] and k.config == d["method_sha256"] == method_sha256(m)
+                     and k.dataset == d["inputs_sha256"] and m["window"] == [8, 12] and m["reverse"] is False
+                     and m["loop"] == {"method": "naive", "k": 1} and type(m["loop"]["k"]) is int
+                     and (k.model == m["compact_manifest_sha256"] and m["compact_recipe"] == "select-20"
+                          if small else k.model == MODEL_SHA256["model.safetensors"]))
+        except (TypeError, KeyError, ValueError, IndexError, AttributeError, RecursionError):
+            raise PolicyError("invalid transfer control witness") from None
+        if not valid:
+            raise PolicyError("not a crossed-slot native development control")
+        return self._reserve((trial_id, hashlib.sha256(proposal).hexdigest(), k.config, ("A100-loop", "A100-compact")[slot]))
+
     def _reserve(self, control: tuple[str, str, str, str] | None = None, target: str | None = None) -> Admission | None:
         with self._transaction() as now:
             if now >= self.finalize_at:

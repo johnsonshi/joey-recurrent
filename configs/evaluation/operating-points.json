@@ -1,0 +1,19 @@
+{
+  "schema": "joey-risk-reporting/v1",
+  "scope": "Supplemental reporting only; neither predictions, nominees nor temperatures change.",
+  "threshold_fit": {
+    "on": "calibration split only", "predictions": "seven raw frozen model and control streams",
+    "risk_targets": [0.01, 0.05, 0.10], "minimum_independent_accepted_groups": 10,
+    "rule": "Among cutoffs located at an observed raw maximum probability, retain complete ties and take greatest coverage whose observed conditional error is at or below the target and meets minimum group support. If none exists, explicitly abstain everywhere. An empirical target is not a risk guarantee."
+  },
+  "fixed_coverage": {
+    "targets": [0.25, 0.50, 0.75, 0.90, 1.0],
+    "rule": "Descriptive final curve: largest whole confidence-tie block prefix with achieved coverage at or below target. Never split a tie, interpolate, or report undefined accuracy as zero."
+  },
+  "reliability": {
+    "bins": 15, "bootstrap_reps": 2000, "seed": 4117,
+    "stratify": "task", "resampling_unit": "independent graph",
+    "uncertainty": "Pointwise 95% bin accuracy intervals. Withhold an interval for a bin supported by fewer than two groups or absent in any resample. Bin supports and missing intervals remain explicit."
+  },
+  "application": "Apply frozen calibration risk cutoffs to raw final predictions only. Separately display the seven raw and symmetrically posthoc-calibrated descriptive reliability and risk-coverage curves; never tune on final labels."
+}
