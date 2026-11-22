@@ -4,7 +4,7 @@
 
 ## Time is part of the run identity
 
-Create the database **once** with `Queue.create(path, run_id=..., start_utc=..., gpu_classes=(class0, class1))`. Supply a unique run digest and the original start time in integer UTC seconds, **before setup**, not the time preflight finishes. Use one durable database on a filesystem with reliable SQLite locking and sync. Each thread or process opens its own connection. Do not use an independent copy, recreate a lost database, or resume an old backup against live workers.
+Infrastructure setup is **outside** the experimental budget. Before the private artifact path, durable result storage, workload namespace and both GPU slots are verified end to end, keep proposals as setup records: there is no experimental start, deadline or timed queue. Once infrastructure is ready, persist that first verified UTC timestamp and create the database **once** with `Queue.create(path, run_id=..., start_utc=..., gpu_classes=(class0, class1))`. Use the readiness timestamp, not the setup launch, later stock-parity completion or next controller wake. Resume the same epoch after a restart. Use one durable database with reliable SQLite locking; never resume a stale copy against live workers.
 
 | Time from the original start | What the queue permits |
 | --- | --- |
