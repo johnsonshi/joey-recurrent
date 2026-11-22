@@ -4,7 +4,6 @@ import os
 import shutil
 import sys
 import tarfile
-import types
 import unittest
 import uuid
 import zipfile
@@ -277,12 +276,14 @@ def inbox(root, refs):
     for k, v in sources.items():
         with (src / k).open("xb") as f:
             f.write(v)
-    shard = disk.canonical({"id": "fixture-1", "state": "public fixture", "split": "discovery"})
+    row = {"id": "fixture-1", "group_id": "invented-group", "task": "toy-routing",
+           "prompt": "Which station receives the parcel?", "choices": ["North", "South"]}
+    shard = disk.canonical(row)
     disk.atomic(dest / "discovery.jsonl", shard)
     spec = {"schema": "joey-ingress-handoff/v1", "sources": {"src/joey_research/" + k: disk.sha(v)
                                                              for k, v in sources.items()},
             "entrypoint": "src/joey_research/worker.py", "discovery_sha256": disk.sha(shard),
-            "discovery_fields": ["id", "state", "split"], **refs}
+            "discovery_fields": sorted(row), **refs}
     raw = disk.canonical(spec)
     disk.atomic(dest / "handoff.json", raw)
     return disk.sha(raw)
@@ -328,22 +329,14 @@ class Assembly(unittest.TestCase):
         self.assertEqual(sum(x.startswith("https://files.pythonhosted.org/") for x in set(net.calls)), 39)
         self.assertIn(web.KERNEL + "/assets/42", net.calls)
         self.assertTrue(all(rec["notices"] for rec in disk.document((root / "wheel-notices.json").read_bytes()).values()))
-        # Only the two permitted public modules are available here. Stand in for the study's
-        # row validator; run the real receipt, wheel, filesystem and digest checks unmodified.
         sys.path.insert(0, str(SURFACE / "src"))
         self.addCleanup(sys.path.remove, str(SURFACE / "src"))
-        ev = types.ModuleType("joey_research.evaluation")
-        def validate(row):
-            self.assertEqual(set(row), {"id", "state", "split"})
-            return disk.sha(disk.canonical(row))
-        ev.input_sha256 = validate
-        with patch.dict(sys.modules, {"joey_research.evaluation": ev}):
-            from joey_research import staging
-            with patch.object(staging, "MODEL_SHA256", p.model), patch.object(staging, "QEV_SHA256", p.qev):
-                args = {k: pins[0][k] for k in ("receipt_sha256", "wheel_lock_sha256", "discovery_sha256")}
-                got = staging.verify_payload(root / "payload", (root / "receipt.json").read_bytes(),
-                                            wheel_lock_bytes=(root / WHEEL_LOCK).read_bytes(), **args)
-                self.assertEqual((got["file_count"], got["decisions"]), (59, 1))
+        from joey_research import staging
+        with patch.object(staging, "MODEL_SHA256", p.model), patch.object(staging, "QEV_SHA256", p.qev):
+            args = {k: pins[0][k] for k in ("receipt_sha256", "wheel_lock_sha256", "discovery_sha256")}
+            got = staging.verify_payload(root / "payload", (root / "receipt.json").read_bytes(),
+                                        wheel_lock_bytes=(root / WHEEL_LOCK).read_bytes(), **args)
+            self.assertEqual((got["file_count"], got["decisions"]), (59, 1))
 
     def test_refuses_labelled_or_unapproved_shards_without_fetching(self):
         for row, fields in [({"id": "x", "state": {"gold_label": "x"}}, ["id", "state"]),
