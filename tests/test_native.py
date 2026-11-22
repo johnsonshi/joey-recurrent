@@ -216,6 +216,40 @@ class NativeContracts(unittest.TestCase):
             b._official_logits(meta)
 
 
+@unittest.skipUnless(os.environ.get("JOEY_TEST_TINY_DEVICE"), "tiny Qwen graph on pinned torch stack not requested")
+class TinyQwenGraph(unittest.TestCase):
+    def test_real_rotary_and_masks_for_sliced_decoder_without_joey_weights(self):
+        import torch
+        from qev import readout
+        from qev.engine import DecisionEngine
+        from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+        device = torch.device(os.environ["JOEY_TEST_TINY_DEVICE"])
+        config = Qwen3_5TextConfig(vocab_size=64, hidden_size=256, intermediate_size=384,
+                                   num_hidden_layers=4, layer_types=list(n.LAYER_TYPES),
+                                   num_attention_heads=1, num_key_value_heads=1, head_dim=256,
+                                   linear_num_key_heads=2, linear_num_value_heads=2,
+                                   linear_key_head_dim=64, linear_value_head_dim=64)
+        config._attn_implementation = "sdpa"
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(123)
+            model = Qwen3_5ForCausalLM(config).to(device=device, dtype=torch.bfloat16).eval()
+        engine = DecisionEngine.__new__(DecisionEngine)
+        engine.model, engine.device = model, device
+        engine._upcast_head(torch.float32)
+        readout.install_noncausal(model)
+        engine.readout = SimpleNamespace(config=SimpleNamespace(noncausal=True))
+        owner = n.NativeJoey(engine)
+        q = n.BranchLayout("q", "choice", ("z", "a"), (32, 33), 3, (1, 2, 3, 4, 5, 6, 7, 8), ((4, 5), (6, 7)))
+        with owner.inference_context():
+            for window in ((1, 3), (2, 4), (0, 4)):
+                b = n.NativeBranch(owner, None, None, q, window)
+                torch.testing.assert_close(b._one_pass(), b._full_logits(), rtol=0, atol=1e-5)
+                h = b._layers(b._prelude(), *window)
+                z2 = b._coda(b._layers(h, *window))
+                self.assertEqual(tuple(z2.shape), (2,))
+                self.assertTrue(torch.isfinite(z2).all().item())
+
+
 @unittest.skipUnless(os.environ.get("JOEY_TEST_MODEL_DIR"), "real, verified local checkpoint not requested")
 class StagedModelIntegration(unittest.TestCase):
     def test_stock_split_and_two_actual_block_calls(self):
