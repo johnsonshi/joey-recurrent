@@ -7,8 +7,9 @@ import json
 import re
 import sqlite3
 import time
+from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable, Iterator, Protocol
@@ -50,6 +51,8 @@ class Gate(str, Enum):
 class Role(str, Enum):
     STOCK = "stock"
     SELECTED = "selected"
+    ZERO_EXTRA = "zero_extra"
+    ORDER_ENSEMBLE = "order_ensemble"
 
 
 class Outcome(str, Enum):
@@ -141,6 +144,112 @@ class Pick:
         _digest(self.test_id)
         if not isinstance(self.role, Role):
             raise PolicyError("expected a typed frozen role")
+
+
+@dataclass(frozen=True)
+class MethodWitness:
+    """Exact canonical worker settings; a new control must name its selected Pick."""
+
+    settings_json: bytes
+    parent: Pick | None = None
+
+
+def _verified_settings(raw: bytes, config: str) -> dict:
+    # Legacy nominations need neither worker settings nor a worker installation.
+    from .worker import method_sha256
+
+    if type(raw) is not bytes or not 0 < len(raw) <= 8192:
+        raise PolicyError("expected bounded canonical method bytes")
+    try:
+        settings = json.loads(raw)
+        canonical = _json(settings).encode("ascii")
+        digest = method_sha256(settings)  # Includes the worker's exact settings validation.
+    except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+        raise PolicyError("invalid worker method settings") from exc
+    if raw != canonical or digest != config:
+        raise PolicyError("method witness is not the exact registered canonical configuration")
+    return settings
+
+
+def _check_method_role(role: Role, settings: dict) -> None:
+    loop = settings["loop"]
+    k, method = loop.get("k", 1), loop.get("method", "naive")
+    if "policy" in settings or loop.get("readout", "final") != "final":
+        raise PolicyError("confirmatory picks require fixed passes and a final readout")
+    if ("order_ensemble" in settings) != (role == Role.ORDER_ENSEMBLE):
+        raise PolicyError("order-ensemble settings and role must agree")
+    if role == Role.SELECTED:
+        if k == 1 or method == "zero_extra":
+            raise PolicyError("a witnessed selected pick must be a recurrent candidate")
+    elif role == Role.STOCK:
+        if k != 1 or method != "naive" or settings["reverse"]:
+            raise PolicyError("ordinary stock must be a forward one-pass call")
+    elif role == Role.ZERO_EXTRA:
+        if k == 1 or method != "zero_extra":
+            raise PolicyError("zero-extra stock must actually take the one-traversal split path")
+    elif role == Role.ORDER_ENSEMBLE:
+        # method_sha256 already requires forward full stock, k=2 zero_extra and
+        # a valid whole-group budget. The allocation seed is not the trial seed.
+        if settings["order_ensemble"]["seed"] != 91473:  # configs/evaluation/promotion.json
+            raise PolicyError("order ensemble differs from the preregistered group allocation seed")
+
+
+def _bind_methods(keys: dict[Pick, tuple[TrialKey, TrialKey]],
+                  witnesses: Mapping[Pick, MethodWitness] | None,
+                  payloads: Mapping[str, str | None] | None) -> tuple[dict[Pick, dict], dict[str, str | None]]:
+    if not isinstance(witnesses, Mapping) or not isinstance(payloads, Mapping):
+        raise PolicyError("a control proposal needs method witnesses and independent model payload pins")
+    witnesses, payloads = dict(witnesses), dict(payloads)
+    if witnesses.keys() != keys.keys() or payloads.keys() != {dev.model for dev, _ in keys.values()}:
+        raise PolicyError("witnesses and payload pins must cover exactly the nominated pairs and models")
+    compact_pins = [_digest(pin) for pin in payloads.values() if pin is not None]
+    if len(compact_pins) != len(set(compact_pins)):
+        raise PolicyError("one compact payload cannot be nominated under multiple model identities")
+
+    evidence = {}
+    claimed_roles = set()
+    recipes = {}
+    for p, (dev, test) in keys.items():
+        w = witnesses[p]
+        if not isinstance(w, MethodWitness) or (dev.trial_id, test.trial_id) != (p.dev_id, p.test_id):
+            raise PolicyError("expected a method witness for this exact registered trial pair")
+        # The pair check in nominate already proved dev.config == test.config.
+        settings = _verified_settings(w.settings_json, dev.config)
+        _check_method_role(p.role, settings)
+        if settings.get("compact_manifest_sha256") != payloads[dev.model]:
+            raise PolicyError("method differs from the independently pinned full or compact payload")
+        recipe = settings.get("compact_recipe")
+        if recipes.setdefault(dev.model, recipe) != recipe:
+            raise PolicyError("compact recipe differs for the same payload")
+        slot = (dev.model, p.role)
+        if slot in claimed_roles:
+            raise PolicyError("only one witnessed pick per model payload and role")
+        claimed_roles.add(slot)
+        evidence[p] = {"settings": settings, "method_sha256": dev.config}
+
+    for p, (dev, test) in keys.items():
+        parent = witnesses[p].parent
+        if p.role in (Role.SELECTED, Role.STOCK):
+            if parent is not None:
+                raise PolicyError("only the additional control roles name a selected parent")
+            continue
+        if not isinstance(parent, Pick) or parent.role != Role.SELECTED or parent not in keys:
+            raise PolicyError("control parent must be an exact selected pair in this proposal")
+        parent_dev, parent_test = keys[parent]
+        # Across the contrast only the method may differ, on BOTH splits.
+        if replace(dev, config=parent_dev.config) != parent_dev or test.dataset != parent_test.dataset:
+            raise PolicyError("control and selected parent differ in trial identity")
+        settings, selected = evidence[p]["settings"], evidence[parent]["settings"]
+        if settings["window"] != selected["window"] or settings["reverse"] != selected["reverse"]:
+            raise PolicyError("control must match its selected window and option order")
+        if p.role == Role.ORDER_ENSEMBLE:
+            lo, hi = selected["window"]
+            extra_visits = (hi - lo) * (selected["loop"]["k"] - 1)
+            spend = settings["order_ensemble"]
+            if 24 * spend["numerator"] != extra_visits * spend["denominator"]:
+                raise PolicyError("whole-group spend does not match the selected extra layer visits")
+        evidence[p]["selected_parent"] = {**asdict(parent), "method_sha256": parent_dev.config}
+    return evidence, payloads
 
 
 @dataclass(frozen=True)
@@ -587,8 +696,10 @@ class Queue:
             self._db.execute("INSERT INTO gates VALUES(?,?,?)", (trial_id, gate.value, proof_sha))
             self._event(now, "gate_passed", trial_id, detail={"gate": gate.value, "proof": proof_sha})
 
-    def nominate(self, picks: Iterable[Pick], *, decision_sha: str) -> None:
-        """Replace the complete dev-only proposal before its irreversible freeze."""
+    def nominate(self, picks: Iterable[Pick], *, decision_sha: str,
+                 witnesses: Mapping[Pick, MethodWitness] | None = None,
+                 payloads: Mapping[str, str | None] | None = None) -> None:
+        """Replace the dev-only proposal; new controls require exact pair and payload witnesses."""
         _digest(decision_sha)
         entries = list(picks)
         if not all(isinstance(p, Pick) for p in entries):
@@ -596,9 +707,13 @@ class Queue:
         with self._transaction() as now:
             if now >= self.freeze_at:
                 raise PolicyError("selection is frozen")
+            witnessed = witnesses is not None or payloads is not None or any(
+                p.role in (Role.ZERO_EXTRA, Role.ORDER_ENSEMBLE) for p in entries)
             cohorts = set()
             plan = []
-            for p in sorted(entries, key=lambda x: (x.test_id, x.role.value, x.dev_id)):
+            keys = {}
+            entries.sort(key=lambda x: (x.test_id, x.role.value, x.dev_id))
+            for p in entries:
                 dev, test = self._trial(p.dev_id), self._trial(p.test_id)
                 if dev["split"] != Split.DEV or dev["state"] != "succeeded" or test["split"] != Split.TEST:
                     raise PolicyError("selection requires completed dev evidence and a test template")
@@ -610,9 +725,15 @@ class Queue:
                 if cohort in cohorts:
                     raise PolicyError("more than one pick for the same model, held-out dataset and role")
                 cohorts.add(cohort)
+                if witnessed:
+                    keys[p] = TrialKey(dataset=dev_split, **dk), TrialKey(dataset=test_split, **tk)
                 plan.append({**asdict(p), "dev_result_sha": dev["result_sha"],
                              "dev_manifest_sha": dev["manifest_sha"], "test_manifest_sha": test["manifest_sha"]})
             proposal = {"decision_sha": decision_sha, "picks": plan}
+            if witnessed:
+                evidence, proposal["payloads"] = _bind_methods(keys, witnesses, payloads)
+                for p, item in zip(entries, plan, strict=True):
+                    item.update(evidence[p])
             encoded = _json(proposal)
             if self._db.execute("SELECT proposal FROM run").fetchone()[0] != encoded:
                 self._db.execute("UPDATE run SET proposal=?", (encoded,))
