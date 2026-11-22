@@ -1,0 +1,14 @@
+{
+  "schema": "joey-training-intent-rank-audit/v1",
+  "scope": "Retrospective CPU analysis of two already released development panels on the same original training complaints. Not independent confirmation, new inference, or an official score.",
+  "arms": ["full-stock", "full-repeat", "compact-stock", "compact-repeat"],
+  "frames": ["research", "native"],
+  "contrast": "Two visits minus one within the same payload and framing. Do not combine the two framings as independent data.",
+  "endpoint": "Rank the gold intent using the stored unrounded probabilities for all 77 legal choices. Use descending probability and original choice index for exact ties. Report deterministic rank-one, top-three, top-five and mean reciprocal rank; retain tie bounds. No temperature adjustment.",
+  "flow": "Count gold-rank moves between ranks 1, 2, 3-5 and 6+. Distinguish an old runner-up becoming first from an intent newly entering the top five.",
+  "sample": "All development rows from the 512 pinned training complaint groups. Preserve complete duplicates. The 16 sampling strata each contributed 32 groups.",
+  "bootstrap": {"unit": "whole normalized complaint group", "strata": "original hexadecimal group hash prefix", "reps": 2000, "seed": 4117, "intervals": "paired pointwise 95%; row-weighted within each resample"},
+  "reconcile": "Every first-place numerator must reproduce the corresponding released full-precision probability score. This is not a rerun of the native rounded typed decoder.",
+  "uses_official_test": false,
+  "changes_frozen_methods": false
+}
