@@ -23,12 +23,14 @@ TRANSFER_MODE = "typed-transfer"
 PROBE_MODE = "one-probe"
 HORIZON_MODE = "routing-horizon"
 EDIT_MODE = "routing-edits"
+CROSS_MODE = "routing-crossover"
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
           "public-native": "banking77-original-train-native77/v1",
           TRANSFER_MODE: "joey-native-inventory-development/v1",
           PROBE_MODE: "joey-fresh-single-probe-routing/v1",
           HORIZON_MODE: "joey-constant-evidence-routing/v1",
           EDIT_MODE: "joey-matched-route-edits/v1",
+          CROSS_MODE: "joey-two-device-timing/v1",
           "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
@@ -55,7 +57,8 @@ class _FixedRoute:
 
 
 _FIXED_ROUTES = {HORIZON_MODE: _FixedRoute("fixed_evidence_route", HORIZON_LOOPS),
-                 EDIT_MODE: _FixedRoute("parcel_entry_route", EDIT_LOOPS)}
+                 EDIT_MODE: _FixedRoute("parcel_entry_route", EDIT_LOOPS),
+                 CROSS_MODE: _FixedRoute("parcel_entry_route", ((1, "naive"), (2, "zero_extra"), (2, "naive")))}
 _SEALED_STREAM_MODES = (TRANSFER_MODE, PROBE_MODE, *_FIXED_ROUTES)
 
 

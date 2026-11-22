@@ -100,6 +100,19 @@ class EditWorkerTest(unittest.TestCase):
                 with self.subTest(mode=mode, changes=changes), self.assertRaises(ValueError):
                     tr._phase_inputs(a.phase_gate())
 
+    def test_crossed_period_reuses_rows_not_old_authority_or_exploratory_depth(self):
+        original = self.release()
+        crossed = self.release(mode=worker.CROSS_MODE)
+        _, _, _, rows = tr._phase_inputs(crossed.phase_gate())
+        self.assertEqual(rows, self.rows)
+        self.assertNotEqual(crossed.permit_sha256, original.permit_sha256)
+        with self.assertRaises(ValueError):
+            tr._phase_inputs(original.phase_gate())
+        four = dict(BASE, loop={"k": 4, "method": "naive"})
+        with self.assertRaises(ValueError):
+            tr._phase_inputs(self.release(mode=worker.CROSS_MODE, settings=four).phase_gate())
+        tr._phase_inputs(self.release(settings=four).phase_gate())
+
     def test_mounted_paths_and_cutoff_are_checked_before_loading(self):
         a = self.release()
         args = dict(phase=EDIT, selection=False, packet=tr.ADMISSION / "packet.json", packet_sha256=a.packet_sha256,

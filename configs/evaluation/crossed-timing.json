@@ -1,0 +1,15 @@
+{
+  "schema": "joey-two-device-timing/v1",
+  "input": "Exact same serialized and ordered 2,304 edited-route development inputs as period one. These are repeated observations, not new decisions or a second accuracy sample.",
+  "roles": ["stock", "split-control", "naive-2"],
+  "models": ["full", "select-20"],
+  "window": [8, 12],
+  "slots_period_one": {"full": 0, "select-20": 1},
+  "slots_period_two": {"full": 1, "select-20": 0},
+  "primary": "On each physical slot compare the compact two-visit CUDA time with the full split-only CUDA time at the same per-row tokens, 18 linear plus 6 full-attention layer calls and one coda. Report the geometric mean of the two slot-specific ratios of mean per-decision CUDA-event times.",
+  "secondary": "Report same-k stock and two-visit ratios separately, and the numerical repeatability of each fixed payload/method on each slot. Do not count the repetition as independent quality evidence.",
+  "resampling": {"unit": "whole original graph within each generator seed, shared across both slots", "reps": 2000, "seed": 4117},
+  "capacity": {"attempt_seconds": 1800, "stage_ceiling_gpu_seconds": 10800, "protected_final_gpu_seconds": 12600},
+  "limitations": "One execution per method, period and slot on two specific devices, batch size one; intervals describe input-mix uncertainty, not repeated-hardware or deployment uncertainty. Cold loads, whole-device VRAM and batched throughput are separate quantities.",
+  "new_labels": false, "change_finalists": false, "allow_norm_overlay": false
+}
