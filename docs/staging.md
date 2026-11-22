@@ -1,0 +1,9 @@
+# Offline ingress checks
+
+Verify three independent facts before admitting a worker: **where** the artifacts came from, **which bytes** are staged, and **what** the runtime can actually load. A local file hash does not establish registry ownership, and a successful registry login does not establish the contents or platform of an image.
+
+`verify_image_pair` in `joey_research.staging` takes the raw base and worker manifests and their configuration blobs, read **by digest** from the approved mirror. It checks the [publisher base lock](../locks/worker-base.json), the independently pinned worker digest, Linux/amd64, and the entire ordered base prefix of both compressed and uncompressed layer descriptors. It rejects external-layer URLs and image indexes in place of the selected platform manifest. Registry authorization and a real pull remain separate checks.
+
+`verify_payload(root, receipt_bytes, receipt_sha256=..., discovery_sha256=...)` checks a materialized, read-only directory, not a remote URL. Obtain both pins independently of this directory. The `joey-discovery-bundle/v1` receipt contains an `assets` array: `path`, `bytes`, `sha256`, `source`, `revision`, `license`. Include the exact stock model and tokenizer files, the eight approved patched runtime files, upstream notices, a pinned wheelhouse and the label-free discovery shard. The verifier hashes every listed file, rejects extra files, checks the shard schema, and refuses links, unknown collections, floating revisions and a bundle larger than 40 GiB.
+
+These functions do not import from a public registry, install packages, execute model code, validate license grants, or authorize Kubernetes jobs. An independent offline import/parity check is still required for the wheel closure and approved runtime. Never point a GPU workload at an upstream service to get past an incomplete mirror.

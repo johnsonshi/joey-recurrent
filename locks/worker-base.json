@@ -1,0 +1,7 @@
+{
+  "upstream": "docker.io/pytorch/pytorch",
+  "tag_at_resolution": "2.8.0-cuda12.8-cudnn9-devel",
+  "platform": "linux/amd64",
+  "manifest_digest": "sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6",
+  "role": "publisher reference base; not an image pull or mirror receipt"
+}
