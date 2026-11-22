@@ -43,9 +43,10 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
     result = run_loop(plan, branch)
     trace = [{"block_evaluations": r.block_evaluations, "kind": r.kind, "probs": ordered(r.logits)} for r in result.readouts]
     lo, hi = window
+    depth = len(native.physical_to_source) if hasattr(native, "physical_to_source") else 24
     return (
         {"id": row["id"], "input_sha256": input_sha256(row), "probs": ordered(result.logits)},
-        {"id": row["id"], "tokens": len(branch.layout.input_ids), "layer_calls": result.counts.layer_evaluations(lo, hi-lo, 24-hi),
+        {"id": row["id"], "tokens": len(branch.layout.input_ids), "layer_calls": result.counts.layer_evaluations(lo, hi-lo, depth-hi),
          "callback_counts": asdict(result.counts), "readouts": trace},
     )
 
@@ -59,8 +60,11 @@ def _load(path: Path, digest: str) -> bytes:
 
 def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
     obj = json.loads(raw)
-    if set(obj) != {"schema", "split", "inputs_sha256", "window", "loop", "reverse", "deadline_utc"} or obj["schema"] != 1:
+    required = {"schema", "split", "inputs_sha256", "window", "loop", "reverse", "deadline_utc"}
+    if set(obj) not in (required, required | {"compact_manifest_sha256"}) or obj["schema"] != 1:
         raise ValueError("unexpected worker packet")
+    if "compact_manifest_sha256" in obj and not re.fullmatch(r"[0-9a-f]{64}", obj["compact_manifest_sha256"]):
+        raise ValueError("invalid compact receipt")
     if obj["split"] != "discovery" or type(obj["reverse"]) is not bool:
         raise ValueError("worker only accepts explicit discovery packets")
     w = obj["window"]
@@ -83,7 +87,10 @@ def run(args) -> None:
     # The coordinator binds a stricter absolute cutoff to this exact packet.
     # The OS alarm also covers initialization and time spent inside native code.
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
-    signal.setitimer(signal.ITIMER_REAL, obj["deadline_utc"] - time.time())
+    remaining = obj["deadline_utc"] - time.time()
+    if remaining <= 0:
+        raise ValueError("worker deadline elapsed before start")
+    signal.setitimer(signal.ITIMER_REAL, remaining)
     rows = [json.loads(s) for s in _load(args.inputs, obj["inputs_sha256"]).splitlines()]
     if not 0 < len(rows) <= 20000 or len({r["id"] for r in rows}) != len(rows):
         raise ValueError("invalid tier or duplicate decision IDs")
@@ -99,7 +106,18 @@ def run(args) -> None:
     os.umask(0o077)
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     begin = time.perf_counter()
-    native = NativeJoey.load(args.model_dir)
+    if "compact_manifest_sha256" in obj:
+        if args.compact_dir is None:
+            raise ValueError("verified compact directory required")
+        from .native_compact import CompactJoey
+        native = CompactJoey.load(args.compact_dir, source_model_dir=args.model_dir,
+                                  expected_manifest_sha256=obj["compact_manifest_sha256"])
+        if native.repeat_window != window:
+            raise ValueError("compact window differs from the verified physical mapping")
+    else:
+        if args.compact_dir is not None:
+            raise ValueError("compact directory without compact manifest pin")
+        native = NativeJoey.load(args.model_dir)
     report = native.verify_parity(window=window)
     measure_choice(native, rows[0], window, plan, reverse=obj["reverse"])
     torch.cuda.synchronize()
@@ -134,6 +152,9 @@ def run(args) -> None:
             "warm_latency_ms": {str(p): ordered_times[math.ceil(len(times)*p/100)-1] for p in (50,95,99)},
             "peak_allocated_bytes": torch.cuda.max_memory_allocated(), "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
             "steady_allocated_bytes": torch.cuda.memory_allocated(), "steady_reserved_bytes": torch.cuda.memory_reserved()}
+    if "compact_manifest_sha256" in obj:
+        info.update(compact_manifest_sha256=obj["compact_manifest_sha256"], reload_parity=asdict(native.reload_report),
+                    physical_layers=len(native.physical_to_source))
     for f, name in zip(outputs, ("predictions.jsonl", "trace.jsonl"), strict=True):
         f.rename(args.output/name)
     with (args.output/"complete.json").open("x") as f:
@@ -146,6 +167,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("packet", "inputs", "model-dir", "output"):
         p.add_argument("--" + name, type=Path, required=True)
+    p.add_argument("--compact-dir", type=Path)
     p.add_argument("--packet-sha256", required=True)
     try:
         run(p.parse_args())

@@ -34,3 +34,15 @@ class WorkerTest(unittest.TestCase):
         for k in (0,9):
             with self.assertRaises(ValueError):
                 _packet(json.dumps({**packet,"split":"discovery","loop":{"k":k}}).encode())
+
+    def test_same_compact_counterpart_charges_physical_coda(self):
+        class Compact:
+            physical_to_source = tuple(range(20))
+            def branches(self, state, questions, *, window):
+                return {"decision":SimpleNamespace(labels=tuple(questions["decision"]["criteria"]),
+                       layout=SimpleNamespace(input_ids=(1,)), stock=lambda: 0, prelude=lambda: 0,
+                       block=lambda h,s:h+1, coda=lambda h,s:h, fresh_state=lambda: object(),
+                       probabilities=lambda h: (.5,.25,.25), inference_context=contextlib.nullcontext)}
+        for k, expected in ((1,20),(2,24)):
+            _,trace = measure_choice(Compact(), self.row, (8,12), LoopPlan(k=k))
+            self.assertEqual(trace["layer_calls"],expected)
