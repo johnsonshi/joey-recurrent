@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -334,7 +335,7 @@ class NativeBranch:
         self._rendered = rendered
         self._layout = layout
         self._window = window
-        self._context = None
+        self._stages = {}
 
     @property
     def layout(self) -> BranchLayout:
@@ -391,6 +392,52 @@ class NativeBranch:
         import torch
         ids = torch.tensor([self.layout.input_ids], dtype=torch.long, device=self._native._engine.device)
         return ids, torch.ones_like(ids)
+
+    def _prelude(self):
+        ids, _ = self._tokens()
+        decoder = self._native._engine.model.model
+        return self._layers(decoder.embed_tokens(ids), 0, self._window[0])
+
+    def _stage(self, start, stop):
+        """A shallow *module view*: keep HF's actual mask/RoPE setup, share all real layer weights."""
+        import torch
+        key = (start, stop)
+        if key not in self._stages:
+            decoder = self._native._engine.model.model
+            stage = copy.copy(decoder)
+            # nn.Module's children live in _modules. Never replace layers/norm on the original.
+            stage._modules = decoder._modules.copy()
+            stage.config = copy.copy(decoder.config)
+            stage.config.num_hidden_layers = stop - start
+            stage.config.layer_types = list(decoder.config.layer_types[start:stop])
+            stage.layers = torch.nn.ModuleList(list(decoder.layers)[start:stop])
+            stage.norm = torch.nn.Identity()  # the real final norm runs exactly once in _coda
+            self._stages[key] = stage
+        return self._stages[key]
+
+    def _layers(self, hidden, start, stop):
+        e = self._native._engine
+        decoder = e.model.model
+        n = len(self.layout.input_ids)
+        embedding = decoder.embed_tokens.weight
+        if (tuple(hidden.shape) != (1, n, decoder.config.hidden_size)
+                or hidden.device != embedding.device or hidden.dtype != embedding.dtype):
+            raise ValueError("hidden must be this branch's full sequence in the native device and dtype")
+        if not 0 <= start <= stop <= len(decoder.layers):
+            raise ValueError("layer range outside physical text decoder")
+        if start == stop:
+            return hidden
+        _, attention = self._tokens()
+        with e._blocks([self.layout.prefix_tokens], [n], n):
+            # This calls Qwen3_5TextModel.forward, not a reimplementation of its rotary positions,
+            # SDPA mask or GatedDeltaNet recurrence. inputs_embeds skips re-embedding.
+            out = self._stage(start, stop)(inputs_embeds=hidden, attention_mask=attention,
+                                           past_key_values=None, use_cache=False, return_dict=True)
+        if out.past_key_values is not None:
+            raise RuntimeError("split stage unexpectedly produced a sequence cache")
+        if tuple(out.last_hidden_state.shape) != tuple(hidden.shape):
+            raise RuntimeError("split stage changed the hidden-state layout")
+        return out.last_hidden_state
 
     def _full_logits(self):
         e = self._native._engine

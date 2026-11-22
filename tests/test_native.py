@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -21,6 +21,88 @@ def fixture_softmax(logits, temperature):
 
 
 class NativeContracts(unittest.TestCase):
+    def test_full_hidden_seam_visits_actual_window_in_order_without_mutating_backbone(self):
+        # Tiny scalar-valued decoder protocol, *not* an implementation of Qwen or a parity claim.
+        calls, masks, norms = [], [], []
+
+        class Hidden:
+            dtype, device = "bf16", "cpu"
+
+            def __init__(self, value, length=5):
+                self.value, self.shape = value, (1, length, 1)
+
+            def __getitem__(self, key):
+                self_test.assertEqual(key, (slice(None), slice(-1, None), slice(None)))
+                return Hidden(self.value, 1)
+
+        class Embedding:
+            weight = Hidden(0)
+
+            def __call__(self, ids):
+                return Hidden(sum(ids))
+
+        def norm(h):
+            norms.append(h.value)
+            return Hidden(h.value + 100)
+
+        class Decoder:
+            def __init__(self):
+                self._modules = {"layers": [0, 1, 2, 3], "norm": norm}
+                self.config = SimpleNamespace(hidden_size=1, num_hidden_layers=4, layer_types=["L", "L", "F", "L"])
+                self.embed_tokens = Embedding()
+
+            layers = property(lambda d: d._modules["layers"], lambda d, v: d._modules.update(layers=v))
+            norm = property(lambda d: d._modules["norm"], lambda d, v: d._modules.update(norm=v))
+
+            def __call__(self, *, inputs_embeds, attention_mask, past_key_values, use_cache, return_dict):
+                self_test.assertEqual(masks[-1], ([2], [5], 5))
+                self_test.assertEqual((attention_mask, past_key_values, use_cache, return_dict), ((1,) * 5, None, False, True))
+                self_test.assertEqual(self.config.num_hidden_layers, len(self.layers))
+                h = inputs_embeds
+                for i, kind in zip(self.layers, self.config.layer_types, strict=True):
+                    calls.append((i, kind))
+                    h = Hidden(h.value * 2 + i + 1)
+                return SimpleNamespace(last_hidden_state=self.norm(h), past_key_values=None)
+
+        class Head:
+            def __call__(self, h):
+                self_test.assertEqual(h.shape, (1, 1, 1))
+                self.value = h.value
+                return self
+
+            def __getitem__(self, key):
+                self_test.assertEqual(key[:2], (0, -1))
+                return SimpleNamespace(float=lambda: [self.value + i for i in key[2]])
+
+        @contextmanager
+        def blocks(prefixes, lengths, width):
+            masks.append((prefixes, lengths, width))
+            try:
+                yield
+            finally:
+                masks.pop()
+
+        self_test = self
+        decoder = Decoder()
+        engine = SimpleNamespace(model=SimpleNamespace(model=decoder, get_output_embeddings=Head), _blocks=blocks)
+        owner = n.NativeJoey(engine)
+        owner._gates[(1, 3)] = object()
+        q = n.BranchLayout("q", "choice", ("z", "a"), (2, 0), 2, (1, 2, 3, 4, 5), ((2, 3), (3, 4)))
+        branch = n.NativeBranch(owner, None, None, q, (1, 3))
+        fake_torch = SimpleNamespace(nn=SimpleNamespace(ModuleList=list, Identity=lambda: (lambda h: h)))
+        with (patch.dict(sys.modules, torch=fake_torch), patch.object(owner, "inference_context", nullcontext),
+              patch.object(branch, "_tokens", return_value=(q.input_ids, (1,) * 5))):
+            self.assertEqual(branch.one_pass(), [368, 366])
+            self.assertEqual(calls, [(0, "L"), (1, "L"), (2, "F"), (3, "L")])
+            calls.clear()
+            h = branch.prelude()
+            for _ in range(2):
+                h = branch.block(h, branch.fresh_state())
+            self.assertEqual(branch.coda(h, branch.fresh_state()), [1168, 1166])
+            self.assertEqual(calls, [(0, "L"), (1, "L"), (2, "F"), (1, "L"), (2, "F"), (3, "L")])
+        self.assertEqual((norms, masks), ([266, 1066], []))
+        self.assertEqual((decoder.layers, decoder.norm, decoder.config.num_hidden_layers), ([0, 1, 2, 3], norm, 4))
+
     def test_local_only_and_integrity(self):
         with self.assertRaisesRegex(ValueError, "local model directory"):
             n._checkpoint_dir("https://invalid.example/not-a-staged-path")
