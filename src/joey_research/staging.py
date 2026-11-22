@@ -148,7 +148,25 @@ def _verify_discovery(file):
     return len(seen)
 
 
-def verify_payload(root: Path, receipt_bytes: bytes, *, receipt_sha256: str, discovery_sha256: str) -> dict:
+def _verify_wheel_inventory(assets, raw_lock, lock_sha):
+    lock = _document(raw_lock, lock_sha)
+    _check(lock.get("kind") == "candidate-metadata-only" and lock.get("base_manifest") == BASE_DIGEST and
+           lock.get("resolution_gaps") == [], "unresolved or unbound runtime lock")
+    expected = {}
+    _check(isinstance(lock.get("packages"), list) and 0 < len(lock["packages"]) <= 256, "invalid dependency set")
+    for p in lock["packages"]:
+        _check(isinstance(p, dict) and isinstance(p.get("filename"), str), "missing wheel record")
+        path = "wheelhouse/" + p["filename"]
+        _check(path not in expected and p.get("reported_license") not in ("", None, "review-required"),
+               "duplicate wheel or unresolved license")
+        expected[path] = (p.get("version"), p.get("sha256"), p.get("bytes"), p.get("source"), p["reported_license"])
+    observed = {path:(r["revision"],r["sha256"],r["bytes"],r["source"],r["license"]) for path,r in assets.items()
+                if path.startswith("wheelhouse/")}
+    _check(observed == expected, "wheelhouse differs from independently pinned dependency set")
+
+
+def verify_payload(root: Path, receipt_bytes: bytes, *, receipt_sha256: str, discovery_sha256: str,
+                   wheel_lock_bytes: bytes, wheel_lock_sha256: str) -> dict:
     """Check a materialized, read-only staging tree. Pins come from the coordinator, not the mounted payload."""
     receipt = _document(receipt_bytes, receipt_sha256)
     _check(set(receipt) == {"schema","assets"} and receipt["schema"] == "joey-discovery-bundle/v1"
@@ -162,6 +180,7 @@ def verify_payload(root: Path, receipt_bytes: bytes, *, receipt_sha256: str, dis
               {"notices/model-LICENSE","notices/model-NOTICE","notices/OneJev-LICENSE","inputs/discovery.jsonl"})
     _check(needed <= assets.keys() and any(f.startswith("wheelhouse/") for f in assets), "incomplete staged bundle")
     _check(assets["inputs/discovery.jsonl"]["sha256"] == discovery_sha256, "unexpected discovery split")
+    _verify_wheel_inventory(assets, wheel_lock_bytes, wheel_lock_sha256)
     total = sum(x["bytes"] for x in assets.values())
     _check(total <= 40 * 2**30, "bundle exceeds staging budget")
     root = Path(root).absolute()
@@ -176,4 +195,4 @@ def verify_payload(root: Path, receipt_bytes: bytes, *, receipt_sha256: str, dis
     for name, item in assets.items():
         _verify_file(root/name, item["bytes"], item["sha256"])
     return {"file_count": len(assets), "bytes": total, "decisions": _verify_discovery(root/"inputs/discovery.jsonl"),
-            "receipt_sha256": receipt_sha256, "discovery_sha256": discovery_sha256}
+            "receipt_sha256": receipt_sha256, "discovery_sha256": discovery_sha256, "wheel_lock_sha256":wheel_lock_sha256}

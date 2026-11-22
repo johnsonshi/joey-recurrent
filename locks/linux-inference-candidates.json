@@ -1,0 +1,394 @@
+{
+  "assumed_target": "CPython 3.11, Linux x86_64, glibc <= 2.35 wheel tags; confirm in staged image",
+  "base_manifest": "sha256:a7103283ea7113e10ae5d014bd2342acebda0bc53164b2f7b1dd6eb7a766bdb6",
+  "constraints_sha256": "7afb5334b5d57ef09e3d8ac2fc670f07182c50ffb51035d5b6eb7898f863edfb",
+  "expected_from_base": {
+    "torch": [
+      "torch",
+      "torch>=2.0.0"
+    ]
+  },
+  "kind": "candidate-metadata-only",
+  "limitations": "Metadata is not payload verification, a license grant, a build lock for another ABI, a registry import, or real offline smoke/parity evidence.",
+  "packages": [
+    {
+      "bytes": 394295,
+      "filename": "accelerate-1.15.0-py3-none-any.whl",
+      "package": "accelerate",
+      "reported_license": "Apache Software License",
+      "sha256": "97eacca0b73e45cb867dbf8c5d5d4dc32219544300e0c8992c7334dc2ef33cec",
+      "source": "https://pypi.org/project/accelerate/1.15.0/",
+      "version": "1.15.0"
+    },
+    {
+      "bytes": 5302,
+      "filename": "annotated_doc-0.0.5-py3-none-any.whl",
+      "package": "annotated-doc",
+      "reported_license": "MIT",
+      "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101",
+      "source": "https://pypi.org/project/annotated-doc/0.0.5/",
+      "version": "0.0.5"
+    },
+    {
+      "bytes": 13427,
+      "filename": "annotated_types-0.8.0-py3-none-any.whl",
+      "package": "annotated-types",
+      "reported_license": "MIT",
+      "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0",
+      "source": "https://pypi.org/project/annotated-types/0.8.0/",
+      "version": "0.8.0"
+    },
+    {
+      "bytes": 132079,
+      "filename": "anyio-4.15.1-py3-none-any.whl",
+      "package": "anyio",
+      "reported_license": "MIT",
+      "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101",
+      "source": "https://pypi.org/project/anyio/4.15.1/",
+      "version": "4.15.1"
+    },
+    {
+      "bytes": 196371690,
+      "condition": "Verify the torch C++ ABI, Linux ABI and CUDA compatibility on the mirrored base.",
+      "filename": "causal_conv1d-1.7.0+cu12torch2.8cxx11abiTRUE-cp311-cp311-linux_x86_64.whl",
+      "package": "causal-conv1d",
+      "reported_license": "BSD License",
+      "sha256": "b28c3657a9d6855e1f95bc912ab94f893434276b437dec8008c92c9f38b6a1f4",
+      "source": "https://github.com/Dao-AILab/causal-conv1d/releases/tag/v1.7.0",
+      "version": "1.7.0"
+    },
+    {
+      "bytes": 125251,
+      "filename": "click-8.5.0-py3-none-any.whl",
+      "package": "click",
+      "reported_license": "BSD-3-Clause",
+      "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+      "source": "https://pypi.org/project/click/8.5.0/",
+      "version": "8.5.0"
+    },
+    {
+      "bytes": 65638,
+      "filename": "einops-0.8.2-py3-none-any.whl",
+      "package": "einops",
+      "reported_license": "MIT License",
+      "sha256": "54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193",
+      "source": "https://pypi.org/project/einops/0.8.2/",
+      "version": "0.8.2"
+    },
+    {
+      "bytes": 244553,
+      "filename": "filelock-4.3.0-py3-none-any.whl",
+      "package": "filelock",
+      "reported_license": "MIT",
+      "sha256": "f933f39f7e01249a4a49b9abab30edc6d4b874624c3de5dd0b0d137aa8adb979",
+      "source": "https://pypi.org/project/filelock/4.3.0/",
+      "version": "4.3.0"
+    },
+    {
+      "bytes": 819225,
+      "filename": "fla_core-0.5.2-py3-none-any.whl",
+      "license_sha256": "41a83c8187efc1e3ccc21909e806a9e52338e69448554d9754706c3d1cd610e7",
+      "license_source": "https://github.com/fla-org/flash-linear-attention/blob/9c8e42e762fce087c27b673af4922795d9edb85e/LICENSE",
+      "package": "fla-core",
+      "reported_license": "MIT",
+      "sha256": "5e830c85bad3d0d34677f98ac7074d08687a3756f0f0499d95ceb96eb6920761",
+      "source": "https://pypi.org/project/fla-core/0.5.2/",
+      "version": "0.5.2"
+    },
+    {
+      "bytes": 399590,
+      "filename": "flash_linear_attention-0.5.2-py3-none-any.whl",
+      "license_sha256": "41a83c8187efc1e3ccc21909e806a9e52338e69448554d9754706c3d1cd610e7",
+      "license_source": "https://github.com/fla-org/flash-linear-attention/blob/9c8e42e762fce087c27b673af4922795d9edb85e/LICENSE",
+      "package": "flash-linear-attention",
+      "reported_license": "MIT",
+      "sha256": "dcf405d81f5426393b59037097aa700d0f4a841465d5028d5aa543f4502f2400",
+      "source": "https://pypi.org/project/flash-linear-attention/0.5.2/",
+      "version": "0.5.2"
+    },
+    {
+      "bytes": 194435,
+      "filename": "fsspec-2025.3.2-py3-none-any.whl",
+      "package": "fsspec",
+      "reported_license": "BSD License",
+      "sha256": "2daf8dc3d1dfa65b6aa37748d112773a7a08416f6c70d96b264c96476ecaf711",
+      "source": "https://pypi.org/project/fsspec/2025.3.2/",
+      "version": "2025.3.2"
+    },
+    {
+      "bytes": 37515,
+      "filename": "h11-0.16.0-py3-none-any.whl",
+      "package": "h11",
+      "reported_license": "MIT License",
+      "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+      "source": "https://pypi.org/project/h11/0.16.0/",
+      "version": "0.16.0"
+    },
+    {
+      "bytes": 4212180,
+      "filename": "hf_xet-1.7.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+      "package": "hf-xet",
+      "reported_license": "Apache-2.0",
+      "sha256": "2814a6e999d13464c4d679b788cc5d784eb5a4edfc638a31f10e9a11ab531ef8",
+      "source": "https://pypi.org/project/hf-xet/1.7.0/",
+      "version": "1.7.0"
+    },
+    {
+      "bytes": 83423,
+      "filename": "httpcore2-2.13.1-py3-none-any.whl",
+      "package": "httpcore2",
+      "reported_license": "BSD-3-Clause",
+      "sha256": "e1e05d4f25f7d7d496bfb96748f6f4b67657b03da069b3a68c36069f3db73d0a",
+      "source": "https://pypi.org/project/httpcore2/2.13.1/",
+      "version": "2.13.1"
+    },
+    {
+      "bytes": 95597,
+      "filename": "httpx2-2.13.1-py3-none-any.whl",
+      "package": "httpx2",
+      "reported_license": "BSD-3-Clause",
+      "sha256": "6dff50fabc270ee5fd25d845d0b078ed20564579744d6d962850975996d2f9a4",
+      "source": "https://pypi.org/project/httpx2/2.13.1/",
+      "version": "2.13.1"
+    },
+    {
+      "bytes": 839884,
+      "filename": "huggingface_hub-2.2.0-py3-none-any.whl",
+      "package": "huggingface-hub",
+      "reported_license": "Apache Software License",
+      "sha256": "1667f145dc56dc210d60966069397df9ecfca9607a5d43db88b308c89dae56b3",
+      "source": "https://pypi.org/project/huggingface-hub/2.2.0/",
+      "version": "2.2.0"
+    },
+    {
+      "bytes": 69583,
+      "filename": "idna-3.20-py3-none-any.whl",
+      "package": "idna",
+      "reported_license": "BSD-3-Clause",
+      "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+      "source": "https://pypi.org/project/idna/3.20/",
+      "version": "3.20"
+    },
+    {
+      "bytes": 134899,
+      "filename": "jinja2-3.1.6-py3-none-any.whl",
+      "package": "jinja2",
+      "reported_license": "BSD License",
+      "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+      "source": "https://pypi.org/project/jinja2/3.1.6/",
+      "version": "3.1.6"
+    },
+    {
+      "bytes": 91687,
+      "filename": "markdown_it_py-4.2.0-py3-none-any.whl",
+      "package": "markdown-it-py",
+      "reported_license": "MIT License",
+      "sha256": "9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a",
+      "source": "https://pypi.org/project/markdown-it-py/4.2.0/",
+      "version": "4.2.0"
+    },
+    {
+      "bytes": 22961,
+      "filename": "markupsafe-3.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "markupsafe",
+      "reported_license": "BSD-3-Clause",
+      "sha256": "6da83a088f8ef93b2d483a8232a4dbf4d69d3d8496b568a03c56becac43e1808",
+      "source": "https://pypi.org/project/markupsafe/3.0.4/",
+      "version": "3.0.4"
+    },
+    {
+      "bytes": 9979,
+      "filename": "mdurl-0.1.2-py3-none-any.whl",
+      "package": "mdurl",
+      "reported_license": "MIT License",
+      "sha256": "84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8",
+      "source": "https://pypi.org/project/mdurl/0.1.2/",
+      "version": "0.1.2"
+    },
+    {
+      "bytes": 422814,
+      "filename": "ninja-1.11.1.4-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.whl",
+      "package": "ninja",
+      "reported_license": "Apache Software License",
+      "sha256": "096487995473320de7f65d622c3f1d16c3ad174797602218ca8c967f51ec38a0",
+      "source": "https://pypi.org/project/ninja/1.11.1.4/",
+      "version": "1.11.1.4"
+    },
+    {
+      "bytes": 16918164,
+      "filename": "numpy-2.4.6-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "numpy",
+      "reported_license": "BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0",
+      "sha256": "89cd468399cfd2504718f0ba50e410dca55a170b61a02ad92bb18c8a65186e93",
+      "source": "https://pypi.org/project/numpy/2.4.6/",
+      "version": "2.4.6"
+    },
+    {
+      "bytes": 129956,
+      "filename": "packaging-26.3-py3-none-any.whl",
+      "package": "packaging",
+      "reported_license": "Apache-2.0 OR BSD-2-Clause",
+      "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+      "source": "https://pypi.org/project/packaging/26.3/",
+      "version": "26.3"
+    },
+    {
+      "bytes": 155560,
+      "filename": "psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "psutil",
+      "reported_license": "BSD-3-Clause",
+      "sha256": "076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9",
+      "source": "https://pypi.org/project/psutil/7.2.2/",
+      "version": "7.2.2"
+    },
+    {
+      "bytes": 488106,
+      "filename": "pydantic-2.14.1-py3-none-any.whl",
+      "package": "pydantic",
+      "reported_license": "MIT",
+      "sha256": "9195d967ec791692a04438115466764fb8b9a27b31f14a760437694f40d6b454",
+      "source": "https://pypi.org/project/pydantic/2.14.1/",
+      "version": "2.14.1"
+    },
+    {
+      "bytes": 2157623,
+      "filename": "pydantic_core-2.50.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "package": "pydantic-core",
+      "reported_license": "MIT",
+      "sha256": "8812592c85d0edf423f10eadcef42716d71e8219085ad9e85b775057b7306133",
+      "source": "https://pypi.org/project/pydantic-core/2.50.1/",
+      "version": "2.50.1"
+    },
+    {
+      "bytes": 1250147,
+      "filename": "pygments-2.21.0-py3-none-any.whl",
+      "package": "pygments",
+      "reported_license": "BSD-2-Clause",
+      "sha256": "2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9",
+      "source": "https://pypi.org/project/pygments/2.21.0/",
+      "version": "2.21.0"
+    },
+    {
+      "bytes": 828016,
+      "filename": "pyyaml-6.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "pyyaml",
+      "reported_license": "MIT License",
+      "sha256": "622aa875fa6533f25fedcffe23079357d65a690d462200afed5d8e9d0e01ebee",
+      "source": "https://pypi.org/project/pyyaml/6.0.4/",
+      "version": "6.0.4"
+    },
+    {
+      "bytes": 804978,
+      "filename": "regex-2026.9.29-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "package": "regex",
+      "reported_license": "Apache-2.0 AND CNRI-Python",
+      "sha256": "612b709381c0355b70d89cdb51b7f670591ed5cbbc0e3b5337488019dc667b65",
+      "source": "https://pypi.org/project/regex/2026.9.29/",
+      "version": "2026.9.29"
+    },
+    {
+      "bytes": 310654,
+      "filename": "rich-15.0.0-py3-none-any.whl",
+      "package": "rich",
+      "reported_license": "MIT License",
+      "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+      "source": "https://pypi.org/project/rich/15.0.0/",
+      "version": "15.0.0"
+    },
+    {
+      "bytes": 516040,
+      "filename": "safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "package": "safetensors",
+      "reported_license": "Apache Software License",
+      "sha256": "fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774",
+      "source": "https://pypi.org/project/safetensors/0.8.0/",
+      "version": "0.8.0"
+    },
+    {
+      "bytes": 9755,
+      "filename": "shellingham-1.5.4-py2.py3-none-any.whl",
+      "package": "shellingham",
+      "reported_license": "ISC License (ISCL)",
+      "sha256": "7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686",
+      "source": "https://pypi.org/project/shellingham/1.5.4/",
+      "version": "1.5.4"
+    },
+    {
+      "bytes": 3396193,
+      "filename": "tokenizers-0.23.3-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+      "package": "tokenizers",
+      "reported_license": "Apache Software License",
+      "sha256": "376851d22bcf9d650a5c3090bb83e6cf9e895fbf0595369fa4cd43c1f69b5f87",
+      "source": "https://pypi.org/project/tokenizers/0.23.3/",
+      "version": "0.23.3"
+    },
+    {
+      "bytes": 80199,
+      "filename": "tqdm-4.70.1-py3-none-any.whl",
+      "package": "tqdm",
+      "reported_license": "MPL-2.0 AND MIT",
+      "sha256": "c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73",
+      "source": "https://pypi.org/project/tqdm/4.70.1/",
+      "version": "4.70.1"
+    },
+    {
+      "bytes": 12599123,
+      "filename": "transformers-5.19.0-py3-none-any.whl",
+      "package": "transformers",
+      "reported_license": "Apache 2.0 License",
+      "sha256": "afcd2dd5f603ed28c1e1fcb00a338ccbb4ef5f878ed289635df8b58187afb518",
+      "source": "https://pypi.org/project/transformers/5.19.0/",
+      "version": "5.19.0"
+    },
+    {
+      "bytes": 19017,
+      "filename": "truststore-0.10.5-py3-none-any.whl",
+      "package": "truststore",
+      "reported_license": "MIT",
+      "sha256": "9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c",
+      "source": "https://pypi.org/project/truststore/0.10.5/",
+      "version": "0.10.5"
+    },
+    {
+      "bytes": 123312,
+      "filename": "typer-0.27.3-py3-none-any.whl",
+      "package": "typer",
+      "reported_license": "MIT",
+      "sha256": "e50022f28b82a86313e54501317a1db64bf8f8d036ff8cfe5ca7e47675454aff",
+      "source": "https://pypi.org/project/typer/0.27.3/",
+      "version": "0.27.3"
+    },
+    {
+      "bytes": 45571,
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "package": "typing-extensions",
+      "reported_license": "PSF-2.0",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "source": "https://pypi.org/project/typing-extensions/4.16.0/",
+      "version": "4.16.0"
+    },
+    {
+      "bytes": 14750,
+      "filename": "typing_inspection-0.4.4-py3-none-any.whl",
+      "package": "typing-inspection",
+      "reported_license": "MIT",
+      "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147",
+      "source": "https://pypi.org/project/typing-inspection/0.4.4/",
+      "version": "0.4.4"
+    }
+  ],
+  "resolution_gaps": [],
+  "roots": [
+    "transformers",
+    "accelerate",
+    "pydantic",
+    "safetensors",
+    "tokenizers",
+    "huggingface-hub",
+    "jinja2",
+    "flash-linear-attention",
+    "fla-core",
+    "causal-conv1d"
+  ],
+  "schema": 1
+}

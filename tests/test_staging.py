@@ -58,9 +58,17 @@ class StagingTest(unittest.TestCase):
                 items.append({"path":name,"bytes":len(data),"sha256":hashlib.sha256(data).hexdigest(),
                               "revision":rev,"license":"MIT","source":source})
             receipt,pin=encoded({"schema":"joey-discovery-bundle/v1","assets":items})
-            def verify():return s.verify_payload(root,receipt,receipt_sha256=pin,discovery_sha256=discovery_sha)
+            wheel={"filename":"sample-1-py3-none-any.whl","reported_license":"MIT","version":"1.0.0",
+                   "sha256":sha,"bytes":len(blob),"source":"https://pypi.org/project/sample/"}
+            lock={"kind":"candidate-metadata-only","base_manifest":s.BASE_DIGEST,"resolution_gaps":[],"packages":[wheel]}
+            def verify(lock_data=None):
+                lock_bytes, lock_pin=encoded(lock if lock_data is None else lock_data)
+                return s.verify_payload(root,receipt,receipt_sha256=pin,discovery_sha256=discovery_sha,
+                                        wheel_lock_bytes=lock_bytes,wheel_lock_sha256=lock_pin)
             outcome=verify()
             self.assertEqual((outcome["file_count"],outcome["decisions"]),(7,1))
+            with self.assertRaisesRegex(s.StageError,"wheelhouse differs"):
+                verify({**lock,"packages":[wheel,{**wheel,"filename":"additional-1-py3-none-any.whl"}]})
             extra=root/"inputs/labels.jsonl";extra.write_bytes(blob)
             with self.assertRaisesRegex(s.StageError,"unexpected"):verify()
             extra.unlink()
