@@ -1,0 +1,26 @@
+{
+  "schema": "joey-public-native-framing/v1",
+  "projection": "banking77-original-train-native77/v1",
+  "question": "Does the response to repeated depth change when the identical complaint and 77 intents are presented as a native q1 request rather than the generic research request?",
+  "scope": "Secondary analysis motivated by the completed training-partition research projection. It reuses the same examples, not a new independent benchmark.",
+  "source": "Only the two inference projections in the previously pinned BANKING77 original-training bundle",
+  "sampling": "Exactly the same 512 normalized complaint groups. No additional groups, official test rows, menu reduction, or new acquisition.",
+  "methods": "Exactly the original six public-development worker method IDs, unchanged, at the same precision, slots and window",
+  "native_input": "Empty state; exactly questions.q1; original instructions and ordered option_0 through option_76 criteria. Verify the two original byte-stream digests, all row identities, input hashes, and menu order.",
+  "endpoints": {
+    "declared_choice": "Use the actual typed native decoder output for choice accuracy, observed-class macro-F1, coverage and disagreements with the first highest-probability option",
+    "full_precision": "Separately score the unrounded ordered slot probabilities from the same forward for NLL, sum-over-class Brier, ECE15 and confident errors",
+    "typed_probabilities": "Keep native precision and its support visible; never fix a probability vector by rounding, flooring or renormalizing",
+    "compute": "Time the actual forward plus the typed decoder. No extra study state is evaluated for warmup."
+  },
+  "contrasts": [
+    "Match each method across research and native framing on identical row IDs and input hashes",
+    "Within each framing compare full naive two-pass with full one-pass and the split-only control; compare compact naive two-pass with the same physical one-pass payload",
+    "Report how the framing changes the repeat-minus-stock accuracy difference for full and compact separately"
+  ],
+  "confidence_thresholds": [0.8, 0.9, 0.95, 0.99],
+  "bootstrap": {"unit": "normalized complaint group", "reps": 2000, "seed": 4117, "interval": "pointwise 95 percent"},
+  "use_for_final_nomination": false,
+  "official_score": false,
+  "capacity": {"stage_ceiling_gpu_seconds": 10800, "protected_final_gpu_seconds": 12600}
+}
