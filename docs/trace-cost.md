@@ -83,3 +83,9 @@ convolution, recurrence or scan, elementwise gates, norms, embeddings, rotary/ma
 loop arithmetic, cache traffic, fusion or kernel padding.
 
 Run the invented fixtures from this folder: `PYTHONPATH=src python3 -B -S -m unittest discover -s tests -p test_trace_cost.py`.
+
+## Two-slot timing crossover
+
+`configs/evaluation/crossed-timing.json` defines a timing replication on the **exact same serialized development inputs** in the same order. The second period exchanges the two physical payloads between the two one-A100 slots. It repeats stock, split-only and two visits for each payload. The primary pair is full split-only versus physical select-20 with two visits: both execute 18 linear-attention and six full-attention layers, with one final readout. Stock timing uses a different native cache path and is not substituted for the split-only endpoint.
+
+For each slot, divide the compact mean synchronized CUDA-event time by the full mean time on matched rows. The balanced ratio is the geometric mean of these two slot-specific ratios. A ratio below one means compact took less time. Whole input graphs, not individual rows or devices, are the sampling units for uncertainty. With two slots and one run per slot/method, this design cannot estimate fleet variability, remove device-by-period effects, or establish a serving-throughput advantage. The repeated probability vectors test numerical reproducibility; they are not independent accuracy samples.
