@@ -106,6 +106,13 @@ The manifest and `complete.json` bind `MODE` (manifest `mode`, metrics `split`),
 
 ### Verified phase collection and ACK-loss recovery
 
+`refinement` is a development-only phase with projection `joey-discovery-remainder/v1`.
+It uses the same independent approval, view, packet, and time pins as calibration,
+but reads only `inputs/refinement.jsonl`. The coordinator must verify that all
+groups come from the original discovery partition and none was in the first screen.
+Only this phase admits the later-cycle and midpoint-MLP 20-layer compact recipes.
+Neither a refinement method nor a result changes any confirmed finalist.
+
 Use the fresh nonce and all launch pins **from the coordinator's own journal**, not from the saved manifest. In addition to the normal private, single-writer destination, retain the exact Pod UID and terminal-state evidence separately:
 
 ```python

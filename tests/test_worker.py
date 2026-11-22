@@ -17,13 +17,23 @@ class WorkerTest(unittest.TestCase):
     def test_constructed_compact_plan_matches_its_independent_export_recipe(self):
         from pathlib import Path
         root=Path(__file__).resolve().parents[1]
-        for name in ("select-20","select-16","merge-16"):
+        for name in ("select-20","select-16","merge-16",*worker.REFINEMENT_RECIPES):
             self.assertEqual(compact_recipe(name),json.loads((root/"configs/compact"/(name+".json")).read_bytes()))
         packet={"schema":1,"split":"discovery","inputs_sha256":"0"*64,"loop":{"k":1},"window":[8,12],
                 "reverse":False,"deadline_utc":100,"compact_recipe":"select-20"}
         with self.assertRaisesRegex(ValueError,"independent"):_packet(json.dumps(packet).encode())
         packet["compact_manifest_sha256"]="1"*64
         self.assertEqual(_packet(json.dumps(packet).encode())[0]["compact_recipe"],"select-20")
+        settings={k:v for k,v in packet.items() if k not in worker._ENVELOPE}
+        for name in worker.REFINEMENT_RECIPES:
+            extra={**settings,"compact_recipe":name};mid=worker.method_sha256(extra)
+            with self.assertRaisesRegex(ValueError,"refinement"):_packet(json.dumps({**packet,**extra}).encode())
+            for split in ("selection","calibration","final","public-development"):
+                envelope={**extra,"method_sha256":mid,"split":split}
+                with self.assertRaisesRegex(ValueError,"refinement"):
+                    worker._nominated(envelope,{mid:extra},{"method_sha256","split"})
+            ok={**extra,"method_sha256":mid,"split":"refinement"}
+            self.assertEqual(worker._nominated(ok,{mid:extra},{"method_sha256","split"})[1],(8,12))
 
     def test_reverse_is_mapped_back_and_does_not_send_bookkeeping(self):
         class Native:

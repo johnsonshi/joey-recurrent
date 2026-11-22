@@ -849,6 +849,30 @@ class Queue:
             raise PolicyError("not an exact one-pass discovery control")
         return self._reserve((trial_id, hashlib.sha256(proposal).hexdigest(), _hash(settings), "A100-"+d["branch"]))
 
+    def reserve_refinement_control(self, trial_id: str, proposal: bytes) -> Admission | None:
+        """Measure one-pass parity for a new physical development payload, not a finalist."""
+        from .worker import REFINEMENT_RECIPES, method_sha256
+
+        _digest(trial_id)
+        if type(proposal) is not bytes or not 0 < len(proposal) <= 16384:
+            raise PolicyError("invalid refinement control proposal")
+        try:
+            d = json.loads(proposal)
+            k, m = TrialKey(**d["key"]), d["settings"]
+            valid = (proposal == _json(d).encode("ascii") and d["schema"] == "joey-refinement-trial/v1"
+                     and d["mode"] == "refinement" and d["run_id"] == self.run_id and d["branch"] == "compact"
+                     and type(d["slot"]) is int and d["slot"] == 1 and k.trial_id == trial_id == d["trial_id"]
+                     and k.dataset == d["inputs_sha256"] and k.config == d["method_sha256"] == method_sha256(m)
+                     and k.model == m["compact_manifest_sha256"] and m["compact_recipe"] in REFINEMENT_RECIPES
+                     and set(m) == {"window", "loop", "reverse", "compact_recipe", "compact_manifest_sha256"}
+                     and m["window"] == [8, 12] and not m["reverse"]
+                     and m["loop"] == {"method":"naive", "k":1} and type(m["loop"]["k"]) is int)
+        except (TypeError, KeyError, ValueError, IndexError, RecursionError):
+            raise PolicyError("invalid refinement control witness") from None
+        if not valid:
+            raise PolicyError("not an exact new-payload development control")
+        return self._reserve((trial_id, hashlib.sha256(proposal).hexdigest(), k.config, "A100-compact"))
+
     def _reserve(self, control: tuple[str, str, str, str] | None = None, target: str | None = None) -> Admission | None:
         with self._transaction() as now:
             if now >= self.finalize_at:

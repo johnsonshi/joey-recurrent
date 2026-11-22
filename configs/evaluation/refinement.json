@@ -1,0 +1,32 @@
+{
+  "schema": "joey-discovery-refinement/v1",
+  "data_rule": "All complete routing graphs in the original discovery partition excluding every first-screen graph. Preserve input bytes and order. Never draw from selection, calibration or final.",
+  "changes_confirmatory_nomination": false,
+  "window": [8, 12],
+  "original_payloads": ["full", "select-20"],
+  "depths": [1, 2, 3, 4, 6, 8],
+  "split_only_control": {"method":"zero_extra","k":2},
+  "integrators": [
+    {"method":"damped_extra","k":4,"alpha":0.5},
+    {"method":"prelude_anchor","k":3,"beta":0.25},
+    {"method":"rk","k":3,"beta":0.5},
+    {"method":"euler","k":3}
+  ],
+  "policy_depth": 4,
+  "policies": [
+    {"pool":"probability_mean"},
+    {"pool":"normalized_logit_mean"},
+    {"pool":"first_anchor","first_weight":0.25},
+    {"pool":"probability_mean","stop":{"kind":"margin","threshold":0.5},"fallback":"first"},
+    {"pool":"probability_mean","stop":{"kind":"margin","threshold":0.5},"fallback":"aggregate"},
+    {"pool":"final","stop":{"kind":"stability","threshold":2},"fallback":"aggregate"}
+  ],
+  "diagnostic_depth": 6,
+  "whole_group_stock_order_control": {"match_depths":[2,3,4,6],"seed":91473,"unmatched_depths":[8]},
+  "additional_payloads": ["select-20-late", "merge-20-mid"],
+  "additional_payload_depths": [1, 2, 3, 4],
+  "attribution": "Earlier versus later middle-cycle selection or uniform merging of the compatible MLPs only, at identical physical depth. Each has its own native and split-only anchors.",
+  "inference": "BF16 backbone; unchanged native legal-slot readout; fresh call-local depth state; no gradient, fit, or test-set tuning.",
+  "statistics": {"equal_task_weight":true,"confidence_thresholds":[0.8,0.9,0.95,0.99],"bootstrap_unit":"independent graph","bootstrap_strata":"task","reps":2000,"seed":4117},
+  "capacity": {"stage_ceiling_gpu_seconds":43200,"protected_final_gpu_seconds":12600}
+}

@@ -20,12 +20,20 @@ from .loop import LoopPlan, run_loop
 from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
+          "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
+REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
 
 
 def compact_recipe(name: str) -> dict:
     if name == "select-20":
         groups, repeat = [{"cycles":[g]} for g in (0,1,2,4,5)], [2,3]
+    elif name == "select-20-late":
+        groups, repeat = [{"cycles":[g]} for g in (0,1,3,4,5)], [2,3]
+    elif name == "merge-20-mid":
+        groups = [{"cycles":[0]}, {"cycles":[1]}, {"cycles":[2,3],"weights":[0.5,0.5],"anchor":2},
+                  {"cycles":[4]}, {"cycles":[5]}]
+        repeat = [2,3]
     elif name == "select-16":
         groups, repeat = [{"cycles":[g]} for g in (0,2,3,5)], [1,3]
     elif name == "merge-16":
@@ -195,6 +203,8 @@ def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
         raise ValueError("unexpected worker packet")
     if obj["split"] != "discovery":
         raise ValueError("worker only accepts explicit discovery packets")
+    if obj.get("compact_recipe") in REFINEMENT_RECIPES:
+        raise ValueError("this compact recipe requires a separate refinement permit")
     return obj, *_settings({k: v for k, v in obj.items() if k not in _ENVELOPE})
 
 
@@ -226,6 +236,8 @@ def _nominated(obj, methods, envelope):
     for key, settings in methods.items():
         if key != method_sha256(settings):
             raise ValueError("invalid nominated method ID")
+        if obj["split"] != "refinement" and settings.get("compact_recipe") in REFINEMENT_RECIPES:
+            raise ValueError("refinement-only recipe outside its authorized phase")
     declared = {k: v for k, v in obj.items() if k not in envelope}
     window, plan = _settings(declared)
     # Comparing canonical bytes also distinguishes true/1, 1/1.0, and a
