@@ -23,7 +23,7 @@ import sys
 import time
 from types import MappingProxyType
 
-from .worker import PHASES, SELECT20_LAYERS, TRANSFER_LOOPS, TRANSFER_MODE, PhaseGate
+from .worker import PHASES, PROBE_MODE, SELECT20_LAYERS, TRANSFER_LOOPS, TRANSFER_MODE, PhaseGate
 
 HOST, PORT = "127.0.0.1", 18765
 WORK, STAGED, ADMISSION = Path("/work"), Path("/staged"), Path("/admission")
@@ -337,6 +337,17 @@ def _completion_binding(metrics, attempt, jsonl_pins):
     phase = attempt.phase_gate().evidence() if attempt.mode in PHASES else {}
     for k in ("run_sha256", "view_sha256", "approval_sha256", "final_freeze_sha256"):
         _require(metrics.get(k) == phase[k] if k in phase else k not in metrics)
+    if attempt.mode==PROBE_MODE:
+        from .probe_runtime import method
+        from .worker import method_sha256
+        settings=metrics.get("probe_settings")
+        _require(type(settings) is dict)
+        method(settings)
+        _require(method_sha256(settings)==metrics["method_sha256"] and settings.get("compact_manifest_sha256")==metrics.get("compact_manifest_sha256"))
+        _native_metrics({k:v for k,v in metrics.items() if k!="probe_settings"})
+        _transfer_metrics(metrics)
+    else:
+        _require("probe_settings" not in metrics)
     if attempt.mode in ("public-native", TRANSFER_MODE):
         _native_metrics(metrics)
     if attempt.mode == TRANSFER_MODE:
@@ -452,8 +463,16 @@ def _transfer_trace(trace, packet_pin, task, probs, depth, expected_calls):
 def _transfer_streams(files, metrics, attempt, *, packet=None, rows=None):
     """Export against the admitted rows/arm; recheck the sealed pair offline without opening a shard."""
     pairs = zip(io.BytesIO(files["predictions.jsonl"]), io.BytesIO(files["trace.jsonl"]), strict=True)
-    expected = (_sealed_transfer_calls(metrics) if packet is None else
-                _transfer_calls(packet["loop"].get("k", 1), packet["loop"].get("method", "naive")))
+    probe = attempt.mode==PROBE_MODE
+    if probe:
+        from .probe_runtime import validate_trace
+        settings=metrics["probe_settings"]
+        if packet is not None:
+            from .worker import _SETTINGS
+            _require(_encoded({k:v for k,v in packet.items() if k in _SETTINGS})==_encoded(settings))
+    else:
+        expected = (_sealed_transfer_calls(metrics) if packet is None else
+                    _transfer_calls(packet["loop"].get("k", 1), packet["loop"].get("method", "naive")))
     depth = metrics.get("physical_layers", 24)
     seen, times = set(), []
     records = zip(rows.items(), pairs, strict=True) if rows is not None else ((None, pair) for pair in pairs)
@@ -473,7 +492,10 @@ def _transfer_streams(files, metrics, attempt, *, packet=None, rows=None):
         else:
             # The collector has no input text or task column. These three widths are disjoint.
             task = {2: "stock-eligibility", 4: "stock-level", 5: "stock-choice"}.get(width)
-        _transfer_trace(trace, attempt.packet_sha256, task, pred["probs"], depth, expected)
+        if probe:
+            validate_trace(trace,pred["probs"],settings=settings,packet_sha256=attempt.packet_sha256)
+        else:
+            _transfer_trace(trace, attempt.packet_sha256, task, pred["probs"], depth, expected)
         seen.add(pred["id"])
         times.append(trace["wall_ms"])
     _require(len(times) == metrics["decisions"])
@@ -493,7 +515,7 @@ def _outputs(run, packet, rows, attempt):
         _require(all(metrics[k] == packet[k] for k in ("split", "permit_sha256", "method_sha256", "inputs_sha256")))
     _require(metrics["decisions"] == len(rows)
              and metrics.get("compact_manifest_sha256") == packet.get("compact_manifest_sha256"))
-    if attempt.mode == TRANSFER_MODE:
+    if attempt.mode in (PROBE_MODE,TRANSFER_MODE):
         _transfer_streams(files, metrics, attempt, packet=packet, rows=rows)
         return files
     _standard_metrics(metrics)
@@ -510,7 +532,7 @@ def _outputs(run, packet, rows, attempt):
                  and len(pred["probs"]) == row.choices and all(type(x) in (float, int) and 0 <= x <= 1
                                                                for x in pred["probs"])
                  and abs(math.fsum(pred["probs"]) - 1) <= 1e-6
-                 and "transfer_answer" not in trace and {"tokens", "layer_calls", "readouts", "wall_ms", "cuda_event_ms",
+                 and not {"transfer_answer","probe"} & trace.keys() and {"tokens", "layer_calls", "readouts", "wall_ms", "cuda_event_ms",
                       "callback_counts"} <= set(trace))
         if attempt.permit_sha256 is not None:
             _require(trace.get("packet_sha256") == attempt.packet_sha256)
@@ -875,7 +897,7 @@ def _check_local(local, raw, doc, attempt, *, durable=False):
     for name, record in doc["files"].items():
         data = _read(local, name, record["bytes"], durable=durable)
         _require(len(data) == record["bytes"] and _sha(data) == record["sha256"])
-        if attempt.mode == TRANSFER_MODE:
+        if attempt.mode in (PROBE_MODE,TRANSFER_MODE):
             transfer[name] = data
         if name == "challenge.bin":
             _require(data == _challenge(attempt))
@@ -886,13 +908,13 @@ def _check_local(local, raw, doc, attempt, *, durable=False):
         elif name == "complete.json":
             _completion_binding(_json(data), attempt,
                                 {n: doc["files"][n]["sha256"] for n in ("predictions.jsonl", "trace.jsonl")})
-        elif name == "trace.jsonl" and attempt.mode != TRANSFER_MODE:
+        elif name == "trace.jsonl" and attempt.mode not in (PROBE_MODE,TRANSFER_MODE):
             for line in io.BytesIO(data):
                 trace = _json(line)
                 if attempt.mode == "public-native":
                     _native_trace(trace, attempt.packet_sha256)
                 else:
-                    _require(type(trace) is dict and not {"transfer_answer", "native_answer"} & trace.keys())
+                    _require(type(trace) is dict and not {"transfer_answer", "native_answer", "probe"} & trace.keys())
     if transfer:  # Failure and timeout publications have no files.
         _transfer_streams(transfer, _json(transfer["complete.json"]), attempt)
 

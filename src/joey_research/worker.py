@@ -20,9 +20,11 @@ from .loop import LoopPlan, run_loop
 from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
 TRANSFER_MODE = "typed-transfer"
+PROBE_MODE = "one-probe"
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
           "public-native": "banking77-original-train-native77/v1",
           TRANSFER_MODE: "joey-native-inventory-development/v1",
+          PROBE_MODE: "joey-fresh-single-probe-routing/v1",
           "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
@@ -160,9 +162,12 @@ def _transfer_arm(window, plan, compact):
 
 
 def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
-                   policy=None, split="discovery") -> tuple[dict, dict]:
+                   policy=None, split="discovery", probe_margin=None) -> tuple[dict, dict]:
     if split not in ("discovery", "selection", *PHASES):
         raise ValueError("unsupported inference split")
+    if probe_margin is not None and (split!=PROBE_MODE or reverse or policy is not None or tuple(window)!=(8,12)
+                                     or plan.method!="naive" or plan.readout!="final"):
+        raise ValueError("first-margin policy requires its own stage and forward order")
     order = tuple(range(len(row["choices"])))
     if reverse:
         order = order[::-1]
@@ -200,7 +205,17 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
     depth = len(native.physical_to_source) if hasattr(native, "physical_to_source") else 24
     digest = input_sha256(row)
     more = {}
-    if policy is None:
+    if probe_margin is not None:
+        from .one_probe import run_one_probe
+        if branch.temperature!=1:raise ValueError("first margin requires native raw probabilities")
+        result=run_one_probe(branch,cap=plan.k,threshold=probe_margin)
+        counts=result.counts
+        if result.labels!=tuple(branch.labels):raise ValueError("native probe keys changed")
+        p=original_order(result.first_probabilities if result.exit_depth==1 else branch.probabilities(result.logits))
+        more["probe"]={"first_probs":original_order(result.first_probabilities),"first_margin":result.first_margin,
+                       "exit_pass":result.exit_depth,"reason":"margin_met" if result.exit_depth==1 else "continue_to_cap"}
+        trace=[]
+    elif policy is None:
         result = run_loop(plan, branch)
         counts = result.counts
         p = original_order(branch.probabilities(result.logits))
@@ -252,7 +267,7 @@ def _policy(obj):
 _ENVELOPE = {"schema", "split", "inputs_sha256", "deadline_utc"}
 _SELECTION_ENVELOPE = _ENVELOPE | {"permit_sha256", "method_sha256"}
 _REQUIRED_SETTINGS = {"window", "loop", "reverse"}
-_SETTINGS = _REQUIRED_SETTINGS | {"policy", "compact_recipe", "compact_manifest_sha256", "order_ensemble"}
+_SETTINGS = _REQUIRED_SETTINGS | {"policy", "compact_recipe", "compact_manifest_sha256", "order_ensemble", "probe_margin"}
 PERMIT_LIMIT = 128 * 1024
 
 
@@ -298,6 +313,9 @@ def ensemble_groups(task_groups, config, *, split):
 def _settings(obj):
     if type(obj) is not dict or not _REQUIRED_SETTINGS <= obj.keys() <= _SETTINGS or type(obj["reverse"]) is not bool:
         raise ValueError("unexpected inference settings")
+    if "probe_margin" in obj:
+        from .probe_runtime import method
+        method(obj)
     if "compact_manifest_sha256" in obj and not _pin(obj["compact_manifest_sha256"]):
         raise ValueError("invalid compact receipt")
     if "compact_recipe" in obj:
@@ -338,6 +356,7 @@ def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
         raise ValueError("unexpected worker packet")
     if obj["split"] != "discovery":
         raise ValueError("worker only accepts explicit discovery packets")
+    if "probe_margin" in obj:raise ValueError("first-margin method requires an independent phase release")
     if obj.get("compact_recipe") in REFINEMENT_RECIPES:
         raise ValueError("this compact recipe requires a separate refinement permit")
     return obj, *_settings({k: v for k, v in obj.items() if k not in _ENVELOPE})
@@ -374,6 +393,14 @@ def _nominated(obj, methods, envelope):
             raise ValueError("invalid nominated method ID")
         if obj["split"] != "refinement" and settings.get("compact_recipe") in REFINEMENT_RECIPES:
             raise ValueError("refinement-only recipe outside its authorized phase")
+        if obj["split"] == PROBE_MODE:
+            from .probe_runtime import method
+            arm=method(settings)
+            if arm[0]:
+                compact_pins.add(settings["compact_manifest_sha256"])
+            if arm in arms or len(compact_pins)>1:raise ValueError("duplicate probe arm or different compact payloads")
+            arms.add(arm)
+        elif "probe_margin" in settings:raise ValueError("first-margin method outside its independent phase")
         if obj["split"] in ("public-native", TRANSFER_MODE):
             window, plan = _settings(settings)
             compact = "compact_manifest_sha256" in settings
@@ -516,6 +543,8 @@ def phase_rows(raw, view):
             typed_transfer_payload(row)
         else:
             input_sha256(row)
+            if view["split"]==PROBE_MODE and (len(row["choices"])!=4 or row["task"] not in ("routing_2hop","routing_3hop","routing_4hop")):
+                raise ValueError("single-probe view needs four-way routed decisions")
         if len(rows) >= view["rows"] or row["id"] in seen or len(row["choices"]) > 255:
             raise ValueError("phase row inventory differs")
         if view["split"] in ("public-development", "public-native") and (
@@ -559,7 +588,7 @@ def run(args) -> None:
         if (selection or nomination_pin is not None or phase not in PHASES
                 or args.packet != transport.ADMISSION / "packet.json" or args.model_dir != transport.STAGED / "model"
                 or args.inputs != transport.STAGED / "inputs" / (phase + ".jsonl")
-                or (phase == TRANSFER_MODE and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
+                or (phase in (PROBE_MODE,TRANSFER_MODE) and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
                 or args.compact_dir not in (None, transport.STAGED / "compact")):
             raise ValueError("wrong phase launch")
         gate = PhaseGate(phase, args.admit_before, args.hard_stop, args.packet_sha256, args.phase_permit_sha256,
@@ -577,8 +606,8 @@ def run(args) -> None:
     else:
         if nomination_pin is not None:
             raise ValueError("discovery cannot consume a nomination")
-        if getattr(args, "inputs", None) == transport.STAGED / "inputs" / (TRANSFER_MODE + ".jsonl"):
-            raise ValueError("transfer shard requires its phase gate")
+        if getattr(args, "inputs", None) in (transport.STAGED / "inputs" / (n + ".jsonl") for n in (TRANSFER_MODE,PROBE_MODE)):
+            raise ValueError("transfer or probe shard requires its phase gate")
         obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
     if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 30 * 3600:
         raise ValueError("expired or unbounded worker deadline")
@@ -665,7 +694,7 @@ def run(args) -> None:
             start.record()
             if ensemble is None:
                 pred, diagnostic = measure_choice(native, row, window, plan, reverse=obj["reverse"],
-                                                  policy=policy, split=split)
+                                                  policy=policy, split=split, **({"probe_margin":obj["probe_margin"]} if "probe_margin" in obj else {}))
             else:
                 pred, diagnostic = _measure_ensemble(native, row, window, plan, split, second=row["group_id"] in selected)
                 spend["forward_calls"] += diagnostic["forward_calls"]
@@ -702,6 +731,8 @@ def run(args) -> None:
         info["result_sha256"] = {name: digest.hexdigest() for name, digest in digests.items()}
     if gate is not None:
         info.update(gate.evidence())
+    if phase==PROBE_MODE:
+        info["probe_settings"]={k:v for k,v in obj.items() if k in _SETTINGS}
     if ensemble is not None:
         info["compute_spend"] = spend
     for f, name in zip(outputs, names, strict=True):
