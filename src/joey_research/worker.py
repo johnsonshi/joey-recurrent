@@ -16,6 +16,7 @@ from dataclasses import asdict
 
 from .evaluation import input_sha256
 from .loop import LoopPlan, run_loop
+from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
 
 def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
@@ -27,7 +28,7 @@ def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
     return row["prompt"], {"decision": {"type": "choice", "instructions": "Select the best option.", "criteria": criteria}}
 
 
-def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False) -> tuple[dict, dict]:
+def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False, policy=None) -> tuple[dict, dict]:
     order = tuple(range(len(row["choices"])))
     if reverse:
         order = order[::-1]
@@ -36,20 +37,33 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
     if tuple(branch.labels) != tuple(questions["decision"]["criteria"]):
         raise ValueError("native option order differs from the request")
 
-    def ordered(logits):
-        p = branch.probabilities(logits)
+    def original_order(p):
         if len(p) != len(order) or any(not math.isfinite(v) or not 0 <= v <= 1 for v in p) or abs(math.fsum(p)-1) > 1e-6:
             raise ValueError("invalid native distribution")
         return [v for _, v in sorted(zip(order, p, strict=True))]
-
-    result = run_loop(plan, branch)
-    trace = [{"block_evaluations": r.block_evaluations, "kind": r.kind, "probs": ordered(r.logits)} for r in result.readouts]
     lo, hi = window
     depth = len(native.physical_to_source) if hasattr(native, "physical_to_source") else 24
+    digest = input_sha256(row)
+    more = {}
+    if policy is None:
+        result = run_loop(plan, branch)
+        counts = result.counts
+        p = original_order(branch.probabilities(result.logits))
+        trace = [{"block_evaluations": r.block_evaluations, "kind": r.kind,
+                  "probs": original_order(branch.probabilities(r.logits))} for r in result.readouts]
+    else:
+        if branch.temperature != 1:
+            raise ValueError("raw-logit policy requires the pinned uncalibrated readout")
+        decision = actuate(plan, branch, lambda: SlotOrder("discovery",digest,tuple(branch.labels)), policy)
+        counts = decision.executed
+        p = original_order(decision.probabilities)
+        trace = []
+        more = {"policy_decision_pass":decision.decision_pass,"policy_reason":decision.reason,
+                "policy_fallback":decision.fallback_used, "mode":"live-actuated"}
     return (
-        {"id": row["id"], "input_sha256": input_sha256(row), "probs": ordered(result.logits)},
-        {"id": row["id"], "tokens": len(branch.layout.input_ids), "layer_calls": result.counts.layer_evaluations(lo, hi-lo, depth-hi),
-         "callback_counts": asdict(result.counts), "readouts": trace},
+        {"id": row["id"], "input_sha256": digest, "probs": p},
+        {"id": row["id"], "tokens": len(branch.layout.input_ids), "layer_calls": counts.layer_evaluations(lo, hi-lo, depth-hi),
+         "callback_counts": asdict(counts), "readouts": trace, **more},
     )
 
 
@@ -60,10 +74,21 @@ def _load(path: Path, digest: str) -> bytes:
     return data
 
 
+def _policy(obj):
+    if not isinstance(obj,dict) or set(obj)-{"pool","stop","fallback","first_weight"}:
+        raise ValueError("invalid discovery policy")
+    cfg=dict(obj)
+    if "stop" in cfg:
+        if not isinstance(cfg["stop"],dict) or set(cfg["stop"])!={"kind","threshold"}:
+            raise ValueError("invalid stopping rule")
+        cfg["stop"]=Stop(**cfg["stop"])
+    return Policy(**cfg)
+
+
 def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
     obj = json.loads(raw)
     required = {"schema", "split", "inputs_sha256", "window", "loop", "reverse", "deadline_utc"}
-    if set(obj) not in (required, required | {"compact_manifest_sha256"}) or obj["schema"] != 1:
+    if not required <= set(obj) <= (required | {"compact_manifest_sha256","policy"}) or obj["schema"] != 1:
         raise ValueError("unexpected worker packet")
     if "compact_manifest_sha256" in obj and not re.fullmatch(r"[0-9a-f]{64}", obj["compact_manifest_sha256"]):
         raise ValueError("invalid compact receipt")
@@ -77,6 +102,10 @@ def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
     plan = LoopPlan(**obj["loop"])
     if plan.k > 8:
         raise ValueError("pass budget exceeded")
+    if "policy" in obj:
+        _policy(obj["policy"])
+        if plan.method not in ("naive","damped_extra") or plan.readout != "final":
+            raise ValueError("live pooling needs completed repeats; use separate diagnostic packets for recording")
     return obj, (w[0], w[1]), plan
 
 
@@ -123,7 +152,8 @@ def run(args) -> None:
             raise ValueError("compact directory without compact manifest pin")
         native = NativeJoey.load(args.model_dir)
     report = native.verify_parity(window=window)
-    measure_choice(native, rows[0], window, plan, reverse=obj["reverse"])
+    policy = _policy(obj["policy"]) if "policy" in obj else None
+    measure_choice(native, rows[0], window, plan, reverse=obj["reverse"], policy=policy)
     torch.cuda.synchronize()
     warmup_s = time.perf_counter() - begin
     torch.cuda.reset_peak_memory_stats()
@@ -137,7 +167,7 @@ def run(args) -> None:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            pred, diagnostic = measure_choice(native, row, window, plan, reverse=obj["reverse"])
+            pred, diagnostic = measure_choice(native, row, window, plan, reverse=obj["reverse"], policy=policy)
             end.record()
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - wall) / 1e6

@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from joey_research.loop import LoopPlan
+from joey_research.loop_analysis import Policy, Stop
 from joey_research.worker import _packet, choice_request, measure_choice
 
 
@@ -46,3 +47,15 @@ class WorkerTest(unittest.TestCase):
         for k, expected in ((1,20),(2,24)):
             _,trace = measure_choice(Compact(), self.row, (8,12), LoopPlan(k=k))
             self.assertEqual(trace["layer_calls"],expected)
+
+    def test_live_policy_pays_for_stop_readout_and_restores_original_order(self):
+        class Native:
+            def branches(self,state,questions,*,window):
+                return {"decision":SimpleNamespace(labels=tuple(questions["decision"]["criteria"]),
+                        layout=SimpleNamespace(input_ids=(1,2)), temperature=1., prelude=lambda:0,
+                        block=lambda h,s:h+1,coda=lambda h,s:[4.,0.,-2.] if h==2 else [0.,0.,0.],
+                        fresh_state=lambda:object(),inference_context=contextlib.nullcontext)}
+        pred,trace=measure_choice(Native(),self.row,(8,12),LoopPlan(k=5),reverse=True,
+                                  policy=Policy(stop=Stop("margin",0.5)))
+        self.assertGreater(pred["probs"][2],.9)
+        self.assertEqual((trace["policy_decision_pass"],trace["layer_calls"],trace["callback_counts"]["coda_calls"]),(2,40,2))
