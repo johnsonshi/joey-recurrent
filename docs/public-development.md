@@ -45,3 +45,19 @@ For `native`, submit `{id,input_sha256,status,response}` when `status="ok"`; `re
 `observed_class_macro_f1` averages F1 over the union of gold and predicted classes on completed choices. For native-shaped responses it uses the declared choice, not necessarily the probability argmax. For the generic projection it uses the first argmax. Always report `states_with_choice`, `choice_coverage`, `scored_gold_or_predicted_classes`, `groups_with_any_choice`, and the failure counts alongside F1. This is row-weighted within class; duplicate records are not independent bootstrap units. `probability_metrics` contains full-population NLL, sum-over-class Brier, 15-bin ECE and argmax accuracy. Proper scores are withheld for incomplete or invalid distributions. A native vector may meet the kit's `0.01` mass tolerance but not Joey's `1e-6`; the report retains the different supports. A zero probability on gold gives infinite NLL, represented by `null` and `nll_status="infinite"`.
 
 Python API: `stage(Path(out), fetch=True)` or `stage(Path(out), source_dir=Path(local_dir))`; `split_groups(Iterable[BlindRow])`; `score_development(inputs, labels, predictions, projection="native"|"research")`. The CLI verifies the bundle pin; the in-memory score API assumes the caller has already verified it.
+
+## Where did the correct intent rank?
+
+The optional secondary analysis in `configs/evaluation/public-ranks.json` compares the **same rows and same framing** before and after a second middle-block visit. It uses stored, unrounded probabilities for all 77 options, not the native decoder's rounded response. A top-five hit means the correct intent was among the five highest-scoring options; it does not mean the model selected it. Mean reciprocal rank gives credit of 1 for first place, 1/2 for second place, and so on.
+
+On the host, after verifying both original score releases, the common bundle, and both full-precision streams:
+
+```python
+from joey_research.paired_rank import rank_contrast
+
+strata = {row["group_id"]: row["group_id"][0] for row in inputs}
+audit = rank_contrast(inputs, labels, stock_predictions, repeat_predictions,
+                      strata=strata, reps=2000, seed=4117)
+```
+
+Exact ties use original menu order for the reported deterministic ranks. The audit also gives bounds under other exact tie breaks. The paired intervals resample whole complaint groups within their original hash strata. This is a reanalysis of existing training predictions, not a second sample, a model run, or a test score.
