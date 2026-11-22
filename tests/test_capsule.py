@@ -106,6 +106,8 @@ class Fixture(unittest.TestCase):
         self.assertNotIn(p.hf("setup.sh"), p.sources)
         self.assertNotIn(p.hf("test.jsonl"), p.sources)
         self.assertTrue(web.redirect_ok(start, "https://cas-bridge.xethub.hf.co/xet-bridge-us/a/b?fixture=1"))
+        self.assertTrue(web.redirect_ok(start, "https://us.aws.cdn.hf.co/xet-bridge-us/a/b?fixture=1"))
+        self.assertFalse(web.redirect_ok(start, "https://us.aws.cdn.hf.co/other/a/b"))
         self.assertFalse(web.redirect_ok(start, "https://huggingface.co/baselabs/joey-1/resolve/main/NOTICE"))
         from urllib.parse import urlunsplit
         with_userinfo = urlunsplit(("https", "reader@huggingface.co", "/model", "", ""))

@@ -41,6 +41,8 @@ def redirect_ok(initial, target):
             return b.path == "/api/resolve-cache/models/baselabs/joey-1/" + suffix
         if b.hostname == "cas-bridge.xethub.hf.co":
             return b.path.startswith("/xet-bridge-")
+        if b.hostname == "us.aws.cdn.hf.co":
+            return b.path.startswith("/xet-bridge-us/")
         return b.path.startswith("/repos/") and b.hostname in {
             "cdn-lfs.hf.co", "cdn-lfs-us-1.hf.co", "cdn-lfs-eu-1.hf.co",
             "cdn-lfs.huggingface.co", "cdn-lfs-us-1.huggingface.co", "cdn-lfs-eu-1.huggingface.co",
