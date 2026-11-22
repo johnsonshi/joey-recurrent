@@ -1,0 +1,13 @@
+{
+  "schema": "joey-matched-route-edits/v1",
+  "authorization": "Conditional development recipe only. A separate timed allocation decision, protected capacity, immutable blind image, same-payload parity and once-only physical receipts are required. This file cannot authorize execution.",
+  "models": ["full", "select-20"],
+  "window": [8, 12],
+  "arms": ["stock", "split-control", "naive-2", "naive-4"],
+  "groups": 48, "targets": 384, "triples": 768, "rows": 2304,
+  "primary": "Four visits minus split-only on the proportion of fixed-target triples for which all three decisions are correct. Use all triples regardless of performance on the original display.",
+  "secondary": "Two visits minus split-only and stock versus split-only. For each payload retain ordinary row-level accuracy, proper scores, confidence support, paired corrections and corruptions, appropriate switching and preservation, results by distance, measured token counts and actual same-slot CUDA time.",
+  "analysis": {"reps": 2000, "seed": 4117, "thresholds": [0.8, 0.9, 0.95, 0.99], "unit": "whole original graph within generator seed", "intervals": "paired pointwise 95%"},
+  "capacity": {"attempt_seconds": 2700, "stage_ceiling_gpu_seconds": 21600, "protected_final_gpu_seconds": 12600},
+  "change_finalists": false, "norm_overlay_permitted": false, "official_test": false
+}
