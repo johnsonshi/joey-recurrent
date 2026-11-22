@@ -1,0 +1,15 @@
+{
+  "schema": "joey-blind-route-edits-pilot/v1",
+  "reason": "Varying target distance also changes the queried station. Test whether the prediction follows a small change in displayed evidence when the target, menu and question are held fixed.",
+  "seeds": [961103, 961117],
+  "graphs_per_seed": 24,
+  "roots": 4,
+  "chain_length": 6,
+  "queried_hops": [2, 6],
+  "renderings": 2,
+  "conditions": ["base", "target_swap", "other_swap"],
+  "intervention": "Partition the four roots into two pairs once per graph. The alternate graphs swap the destinations of just the two printed root edges in one pair or the other. For a fixed target, one swap changes its entry while the complementary swap preserves it. Those same two edits exchange roles when querying a target from the other root pair. Preserve record order and every other edge within a rendering.",
+  "separation": "Only label-free evaluator rows enter the inference projection. Treatment, case matching, seed, depth and rendering stay in a separate private design file. No adjudication of live inputs during preparation.",
+  "candidate_measure": "If independently admitted later: report the share of matched triples in which all three decisions are correct, including both the necessary switch and the necessary preservation. Never condition the main denominator on baseline correctness. Show individual conditions, hops, token lengths, correction/corruption and group-paired uncertainty separately.",
+  "scope": "Host-only preparation of a fresh blind development instrument. No image build, GPU admission, model weights, labels, test access, update to nominees, or automatic follow-on authorization. A distinct prospective execution and scoring decision would be needed."
+}
