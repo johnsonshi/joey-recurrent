@@ -217,6 +217,16 @@ class QueueTests(unittest.TestCase):
         self.assertEqual((second.slot, second.trial_id), (1, a[-1].key.trial_id))
         self.assertIsNone(q.reserve())
 
+    def test_targeted_reservation_never_returns_another_trial_or_bypasses_either_gate(self):
+        ready = self.add(manifest("ready"))
+        held = self.add(manifest("not-yet-verified"), ready=False)
+        self.assertIsNone(self.q.reserve(trial_id=held))
+        self.q.attest(held, Gate.OFFLINE_STAGING, digest("stage-only"))
+        self.assertIsNone(self.q.reserve(trial_id=held))
+        t = self.q.reserve(trial_id=ready)
+        self.assertEqual(t.trial_id, ready)
+        self.assertIsNone(self.q.reserve(trial_id=ready))
+
     def test_independent_connections_race_for_two_slots(self):
         for index in range(8):
             self.add(manifest(str(index)))

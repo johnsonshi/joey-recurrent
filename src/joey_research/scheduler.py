@@ -694,9 +694,9 @@ class Queue:
                          row["gpu_class"], row["issued_at"], row["admit_before"], row["hard_stop"],
                          deadline)
 
-    def reserve(self) -> Admission | None:
+    def reserve(self, *, trial_id: str | None = None) -> Admission | None:
         """Durably consume one admission before I/O; only its reserving caller may send it."""
-        return self._reserve()
+        return self._reserve(target=_digest(trial_id) if trial_id is not None else None)
 
     def reserve_native_control(self, trial_id: str, proposal: bytes) -> Admission | None:
         """Acquire a slot to *measure* missing one-pass parity, never attest it in advance.
@@ -728,7 +728,7 @@ class Queue:
             raise PolicyError("not an exact one-pass discovery control")
         return self._reserve((trial_id, hashlib.sha256(proposal).hexdigest(), _hash(settings), "A100-"+d["branch"]))
 
-    def _reserve(self, control: tuple[str, str, str, str] | None = None) -> Admission | None:
+    def _reserve(self, control: tuple[str, str, str, str] | None = None, target: str | None = None) -> Admission | None:
         with self._transaction() as now:
             if now >= self.finalize_at:
                 return None
@@ -737,6 +737,9 @@ class Queue:
                 raise PolicyError("native parity acquisition ends at the development freeze")
             gate = "AND (SELECT COUNT(*) FROM gates g WHERE g.trial_id=t.id)=2 "
             extra = ()
+            if target is not None:
+                gate += "AND t.id=? "
+                extra = (target,)
             if control:
                 member = self._trial(control[0])
                 if (member["split"] != Split.DEV or member["manifest_sha"] != control[1] or
