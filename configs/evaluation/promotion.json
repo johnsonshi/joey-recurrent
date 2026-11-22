@@ -1,0 +1,41 @@
+{
+  "schema": "joey-synthetic-selection-v1",
+  "applies_to": "synthetic routing selection, not scientific test",
+  "source_tier": "complete first discovery screen",
+  "selection_weights": "equal task weight",
+  "fixed_replications": [
+    {"branch": "loop", "window": [8, 12], "loop": {"method": "naive", "k": 2}},
+    {"branch": "compact", "plan": "select-20", "k": 2}
+  ],
+  "extra_exploratory_candidates_per_branch": 1,
+  "extra_rule": {
+    "paired_accuracy_lower_above": 0.0,
+    "paired_brier_upper_below": 0.0,
+    "high_error_threshold": 0.9,
+    "max_observed_increase_joint_error": 0.0,
+    "max_observed_stock_accuracy_loss": 0.05,
+    "rank": ["accuracy_delta_lower_desc", "brier_delta_upper_asc", "gpu_ms_asc", "trial_id_asc"]
+  },
+  "controls": {
+    "same_payload_one_pass": true,
+    "same_window_split_zero_extra": true,
+    "extra_stock_spend": "rank whole groups without labels; on the selected fraction run a second reversed-order zero-extra stock traversal and average in original slot order",
+    "ensemble_seed": 91473,
+    "matched_latency_relative_tolerance": 0.10,
+    "measure_remaining_gap": true
+  },
+  "diagnostics_not_finalists": {
+    "fixed_window": [8, 12],
+    "passes": 3,
+    "branches": ["full", "select-20"],
+    "readout_each_completed_pass": true,
+    "pools": ["probability_mean"],
+    "stopping_rule": {"kind": "margin", "threshold": 0.5},
+    "fallback": "first"
+  },
+  "bootstrap": {"unit":"state group", "stratify":"task", "reps":2000, "seed":4117},
+  "high_confidence_thresholds":[0.8,0.9,0.95,0.99],
+  "open_selection_labels_only_after_plan":true,
+  "rerank_during_selection":false,
+  "official_claim":false
+}
