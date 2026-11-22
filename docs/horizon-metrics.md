@@ -78,3 +78,9 @@ counts[signed token difference] = number of tuples at that difference
 ```
 
 For the primary read `report["primary"]["accuracy"]`. For the sensitivity analysis read `report["exact_token"]["accuracy"]` **alongside** `report["exact_token"]["by_seed"]` and `report["token_differences"]["equal_fraction"]`. An eligible graph has at least one eligible tuple.
+
+## Comparing the two payloads directly
+
+`benchmarks.horizon_interaction.payload_interaction(rows, labels, arms, *, design_by_id, tokens, reps=2000, seed=4117)` is a **secondary** four-stream analysis. Both `arms` and `tokens` must contain exactly `full_split`, `full_four`, `compact_split`, and `compact_four`. Each token map must give the same recorded length for each row across *all four* methods. Select the exact method and payload receipts before calling it.
+
+For each graph, it subtracts the compact distance effect from the full one, then resamples the shared graphs. This estimates the difference between the two six-versus-two-hop gains and preserves their covariance. Subtracting the endpoints of the two published confidence intervals does not do this. The return includes the complete and exact-token-matched effects, supports by seed, and descriptive differences in gain at each individual hop. The statistic compares decision outcomes, not latency on different devices.

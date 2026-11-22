@@ -6,6 +6,7 @@ import random
 import unittest
 
 from benchmarks.horizon_metrics import compare_horizons
+from benchmarks.horizon_interaction import ROLES, payload_interaction
 from joey_research import evaluation as ev
 
 
@@ -281,6 +282,44 @@ class HorizonMetricsTests(unittest.TestCase):
                 d = deepcopy(data)
                 d["candidate"][0]["probs"] = probs
                 compare_horizons(**d, reps=0)
+
+
+class CrossPayloadTests(unittest.TestCase):
+    def compare(self, panel, arms=None, tokens=None):
+        if arms is None:
+            arms = dict(zip(ROLES, (panel["baseline"], panel["candidate"]) * 2))
+        if tokens is None:
+            tokens = {name: panel["baseline_tokens"] for name in ROLES}
+        return payload_interaction(panel["rows"], panel["labels"], arms,
+                                  design_by_id=panel["design_by_id"], tokens=tokens, reps=80)
+
+    def test_shared_decisions_cancel_even_when_both_component_intervals_are_wide(self):
+        data = _panel((3, 3), decisions=lambda s, g, e, r, h: (False, h == 6 and g == 0))
+        marginal = compare_horizons(**data, reps=80)["primary"]["accuracy"]["ci95"]
+        self.assertGreater(marginal[1], marginal[0])
+        out = self.compare(data)
+        for component in ("primary", "exact_token"):
+            for metric in ("accuracy", "brier"):
+                self.assertEqual(out[component][metric], {"estimate": 0, "ci95": [0, 0], "defined_reps": 80})
+
+    def test_direction_and_ineligible_token_subset(self):
+        data = _panel((2, 2), decisions=lambda s, g, e, r, h: (False, h == 6),
+                      lengths=lambda s, g, e, r, h: 40 + int(h == 6))
+        roles = dict(zip(ROLES, (data["baseline"], data["candidate"], data["candidate"], data["baseline"])))
+        out = self.compare(data, roles)
+        self.assertEqual(out["primary"]["accuracy"]["estimate"], 2)
+        self.assertEqual(out["primary"]["brier"]["estimate"], -4)
+        self.assertEqual(out["support"]["eligible_tuples"], 0)
+        self.assertIsNone(out["exact_token"]["accuracy"]["ci95"])
+
+    def test_within_payload_length_agreement_is_not_cross_payload_agreement(self):
+        data = _panel((2,))
+        tokens = {name: data["baseline_tokens"].copy() for name in ROLES}
+        key = data["rows"][0]["id"]
+        for name in ROLES[2:]:
+            tokens[name][key] += 1
+        with self.assertRaisesRegex(ev.EvaluationError, "cross-payload"):
+            self.compare(data, tokens=tokens)
 
 
 if __name__ == "__main__":
