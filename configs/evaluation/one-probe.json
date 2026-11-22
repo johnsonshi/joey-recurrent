@@ -1,0 +1,27 @@
+{
+  "schema": "joey-first-margin-one-probe/v1",
+  "scope": "Development-only adaptive depth. Test whether one intermediate coda is a useful way to allocate computation without continually observing exits.",
+  "payloads": ["full", "select-20"],
+  "window": [8, 12],
+  "caps": [2, 3, 4, 6],
+  "margin_thresholds": [0.0, 0.1, 0.25, 0.5, 0.75, 1.0],
+  "policy": "Run exactly one prelude and middle visit, then a coda. Stop if the difference between the two largest unrounded native probabilities is >= threshold. Otherwise continue the same hidden state to cap and run one final coda only. Never look at the label, second-pass stability, later margin, or final-test information to choose an exit.",
+  "design_source": "Only the full and select-20 six-pass diagnostic streams from the original disjoint discovery remainder, after their existing 50-method release. These probabilities support a counterfactual simulation, not a measurement of this new policy's latency.",
+  "partition": {"unit": "graph", "strata": "routing hop task", "rule": "In each of the three 33-graph strata, sort on SHA256(UTF-8 'joey-first-margin-v1:' + group_id), breaking ties by group_id. First 22 graphs fit; last 11 audit. No audit or calibration move may revise any method.", "fit_per_task": 22, "audit_per_task": 11},
+  "training_rule": {
+    "minimum_continue_fraction": 0.10, "maximum_continue_fraction": 0.90,
+    "logical_visit_budget": "At most the mean count for fixed four naive visits with one final coda on this physical payload; include every extra observed coda.",
+    "ranking": ["higher equal-task accuracy", "lower equal-task summed Brier", "fewer actual logical layer visits", "lower cap", "lower threshold"],
+    "if_infeasible": "Do not substitute an all-stop or all-continue rule or relax the budget."
+  },
+  "audit_rule": {
+    "controls": ["fixed two visits", "fixed four visits", "first split pass"],
+    "gate": "A frozen policy may receive a fresh live replication if it is nondegenerate on audit, strictly more accurate than the recorded first pass, has no higher summed Brier than that first pass, and its audit mean logical layer cost does not exceed fixed four visits. Report both fixed deeper comparisons regardless. Do not try another threshold after a failure.",
+    "bootstrap_reps": 2000, "bootstrap_seed": 4117
+  },
+  "conditional_replication": {"generator": "synthetic routed graphs", "namespace": "single-probe-replication-v1", "seed": 419203, "width": 4, "depths": [2, 3, 4], "groups_per_depth": 36,
+    "arms_per_qualified_payload": ["one ordinary native pass", "split-control zero-extra", "naive two passes", "naive four passes", "naive at the chosen cap if distinct", "the frozen one-probe policy"],
+    "unqualified_payloads": "Do not allocate a lane just to spend the budget.", "capacity": {"attempt_seconds": 1800, "stage_ceiling_gpu_seconds": 21600, "protected_final_gpu_seconds": 12600}},
+  "limits": "The audit partition is excluded from threshold selection, not an independently sealed study-wide test. All probe and later Coda work counts. Use real timed comparisons for any efficiency claim. A new transfer is not a new finalist.",
+  "affects_confirmation": false
+}

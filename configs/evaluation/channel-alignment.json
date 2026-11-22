@@ -1,0 +1,16 @@
+{
+  "schema": "joey-common-mlp-channel-basis/v1",
+  "scope": "Optional weight-only analysis of middle MLP merging. No labels, hidden training, inference or changes to the frozen models.",
+  "layer_pairs": [[8, 12], [9, 13], [10, 14], [11, 15]],
+  "projections": ["gate", "up", "down"],
+  "seed_by_earlier_layer": {"8": 127031, "9": 127032, "10": 127033, "11": 127034},
+  "sketch_coordinates_per_projection": 64,
+  "shortlist": 16,
+  "null_reps": 32,
+  "fit": "Split the hidden axis by a seeded permutation into fit and audit halves. Only sample fit coordinates to choose one bijection common to all three projections. Match gate and up rows and down columns. No sign flips, scaling, source-model state changes or repeated matching after inspection.",
+  "audit": "Use the unused hidden coordinates in all three projections to compare aligned and original-index squared differences. Pool sums of squared errors across tensors rather than averaging percentages. A good in-sketch match by itself is not evidence of alignment.",
+  "action_gate": {"maximum_pooled_audit_sse_ratio": 0.95, "maximum_per_pair_ratio": 0.98, "minimum_pairs_passing": 3, "require_function_equivalence": true},
+  "interpretation": "A passing gate warrants testing another physical midpoint export. It does not establish decision quality. If the gate fails, keep the negative result and do not export or allocate a GPU for this alignment scheme.",
+  "budget": {"cpu_threads": 1, "wall_seconds": 2400},
+  "affects_confirmation": false
+}
