@@ -11,6 +11,54 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from joey_research import native_compact as c
+from joey_research import norm_parity as npv
+
+
+class Qwen3_5RMSNorm:
+    def __init__(self, value):
+        self.weight = SimpleNamespace(value=value, shape=(2048,), device="cpu", dtype="torch.bfloat16", requires_grad=False)
+
+
+class NormSourceCanaryContracts(unittest.TestCase):
+    def layers(self):
+        return [SimpleNamespace(input_layernorm=Qwen3_5RMSNorm(j), post_attention_layernorm=Qwen3_5RMSNorm(j+.5))
+                for j in range(24)]
+
+    def test_original_parameters_restored_after_reference_failure(self):
+        layers = self.layers(); keep = [vars(x).copy() for x in layers]
+        old = [getattr(x,n).weight for x in layers for n in npv._NAMES]
+        with self.assertRaises(InterruptedError):
+            with npv._source_donor(layers):
+                for i in range(8,12):
+                    for n in npv._NAMES:
+                        self.assertIs(getattr(layers[i],n).weight, getattr(layers[i+4],n).weight)
+                raise InterruptedError()
+        self.assertEqual([vars(x) for x in layers], keep)
+        self.assertTrue(all(a is b for a,b in zip(old,(getattr(x,n).weight for x in layers for n in npv._NAMES))))
+
+    def test_source_oracle_skips_removed_matrices_and_switches_only_second_visit(self):
+        layers = self.layers(); calls = []
+        class Hidden(float):
+            def clone(self):return Hidden(self)
+        def step(h, a, b):
+            calls.append((a,b))
+            return Hidden(h + sum(1000+i+layers[i].input_layernorm.weight.value
+                                  + layers[i].post_attention_layernorm.weight.value for i in range(a,b)))
+        branch=SimpleNamespace(_window=(0,24),layout="fixture",labels=["x","y"],_prelude=lambda:Hidden(0),_layers=step,
+                               _coda=lambda x:[x,-x],probabilities=lambda z:(.75,.25))
+        with patch.object(npv,"_hidden_pin",return_value="fixture"):
+            d=npv._source_case(branch,layers)
+        self.assertEqual(calls,[(0,8),(8,12),(16,24),(8,12),(16,24),(8,12),(16,24)])
+        self.assertEqual(d["donor_two"][0][0]-d["identity_two"][0][0],32)
+        self.assertLess(d["one"][0][0],d["identity_two"][0][0])
+
+    def test_equal_top_choice_does_not_excuse_wrong_logits_or_missing_norm_calls(self):
+        with self.assertRaisesRegex(ValueError,"independent source"):
+            npv._compare(((2.,1.),(.7,.3)), ((2.01,1.),(.7,.3)))
+        seen={k:1 for k,_,_ in npv.pass_norms._pairs()}
+        result=SimpleNamespace(counts=npv.LoopCounts(0,1,2,1),norm_calls=seen)
+        npv._check_counts(result,2);seen[next(iter(seen))]=0
+        with self.assertRaisesRegex(ValueError,"normalization calls"):npv._check_counts(result,2)
 
 
 class CompactContracts(unittest.TestCase):
