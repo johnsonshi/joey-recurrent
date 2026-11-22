@@ -1,0 +1,10 @@
+[project]
+name = "joey-recurrence"
+version = "0.1.0"
+description = "Training-free recurrence experiments for structured decisions"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]

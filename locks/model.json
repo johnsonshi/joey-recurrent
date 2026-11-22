@@ -1,0 +1,18 @@
+{
+  "model": "baselabs/joey-1",
+  "revision": "db5c2a631f2da93c4173378438d8246966e25159",
+  "source": "https://huggingface.co/baselabs/joey-1",
+  "license": ["Apache-2.0 (base)", "MIT (modifications)"],
+  "verified_config": {
+    "text_layers": 24,
+    "linear_attention_layers": 18,
+    "full_attention_layers": 6,
+    "full_attention_interval": 4,
+    "full_attention_mask": "block_bidirectional",
+    "linear_attention_mask": "causal",
+    "hidden_size": 2048,
+    "tie_word_embeddings": true,
+    "readout": "slot_lm"
+  },
+  "status": "Source and configuration identified. This lock alone does not establish artifact integrity or stock parity."
+}
