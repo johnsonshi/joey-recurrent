@@ -1,0 +1,10 @@
+{
+  "format": "joey-compact/v1",
+  "groups": [
+    {"cycles": [0]},
+    {"cycles": [2]},
+    {"cycles": [3]},
+    {"cycles": [5]}
+  ],
+  "repeat_cycles": [1, 3]
+}
