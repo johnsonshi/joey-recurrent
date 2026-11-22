@@ -163,3 +163,50 @@ class WorkerTest(unittest.TestCase):
                           {"denominator": 0}, {"denominator": 10001}, {"rank_by": "confidence"}))):
             with self.subTest(wrong=wrong), self.assertRaises(ValueError):
                 _packet(json.dumps(dict(base, **wrong)).encode())
+
+    def test_public_native_frozen_six_are_genuine_measured_loops(self):
+        common = {"window": [8, 12], "reverse": False}
+        compact = {"compact_recipe": "select-20", "compact_manifest_sha256": "a"*64}
+        arms = [(dict(common, loop={"k": k, "method": m}, **extra), layer_calls) for k,m,extra,layer_calls in (
+            (1,"naive",{},24), (2,"zero_extra",{},24), (2,"naive",{},28), (3,"euler",{},32),
+            (1,"naive",compact,20), (2,"naive",compact,24))]
+        methods = {worker.method_sha256(s): s for s,_ in arms}
+        def admit(s, extra=None):
+            mid = worker.method_sha256(s)
+            all_methods = methods if extra is None else {**methods, worker.method_sha256(extra): extra}
+            return worker._nominated(dict(s, split="public-native", method_sha256=mid), all_methods, {"split","method_sha256"})
+        row = dict(self.row, choices=[f"c{i}" for i in range(77)])
+        for s, charged in arms:
+            with self.subTest(settings=s):
+                _, window, plan = admit(s)
+                observed, vectors, decoded = [], [], []
+                def invoke(op, value):
+                    observed.append(op)
+                    return value
+                p = [1/77]*77
+                def decode(z):
+                    decoded.append(z)
+                    return {"type": "choice", "choice": "option_4", "probabilities": dict(zip(worker.NATIVE_OPTIONS,p))}
+                b = SimpleNamespace(labels=worker.NATIVE_OPTIONS, layout=SimpleNamespace(input_ids=(1,)),
+                    stock=lambda: invoke("stock_calls", 1.), prelude=lambda: invoke("prelude_calls", 0.),
+                    block=lambda h,state: invoke("block_calls", h+1.), coda=lambda h,state: invoke("coda_calls", h),
+                    probabilities=lambda z: vectors.append(z) or p, decode=decode, fresh_state=object,
+                    inference_context=contextlib.nullcontext)
+                native = SimpleNamespace(branches=lambda *args,**kw: {"q1": b})
+                if "compact_recipe" in s:
+                    native.physical_to_source = tuple(range(20))
+                _, trace = measure_choice(native, row, window, plan, split="public-native")
+                self.assertEqual(len(decoded), 1)
+                self.assertEqual(len(vectors), 1)
+                self.assertIs(decoded[0], vectors[0])
+                self.assertEqual(trace["layer_calls"], charged)
+                self.assertEqual(trace["callback_counts"], {k: observed.count(k) for k in trace["callback_counts"]})
+        base = arms[0][0]
+        for prohibited in (dict(base, reverse=True), dict(base, window=[4,8]), dict(base, policy={}),
+                           dict(base, loop={"k": 3, "method": "naive"}), dict(base, loop={"readout":"diagnostic"}),
+                           dict(base, compact_manifest_sha256="a"*64), dict(base, **dict(compact,compact_recipe="select-16")),
+                           dict(arms[3][0], **compact),
+                           dict(arms[1][0], order_ensemble={"numerator":1,"denominator":2,"seed":0})):
+            # Even an unused out-of-scope entry invalidates the permit.
+            with self.subTest(prohibited=prohibited), self.assertRaises(ValueError):
+                admit(base, prohibited)

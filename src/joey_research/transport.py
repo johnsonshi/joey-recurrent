@@ -337,6 +337,39 @@ def _completion_binding(metrics, attempt, jsonl_pins):
     phase = attempt.phase_gate().evidence() if attempt.mode in PHASES else {}
     for k in ("run_sha256", "view_sha256", "approval_sha256", "final_freeze_sha256"):
         _require(metrics.get(k) == phase[k] if k in phase else k not in metrics)
+    if attempt.mode == "public-native":
+        _native_metrics(metrics)
+
+
+def _native_metrics(metrics):
+    # No new channel for request/debug metadata, including nested parity reports.
+    from dataclasses import fields
+    from .native import ParityReport
+    keys = {"schema", "packet_sha256", "batch_size", "decisions", "parity", "hardware", "total_device_bytes",
+            "warmup_load_and_parity_s", "wall_including_persistence_s", "decisions_per_wall_s", "warm_latency_ms",
+            "peak_allocated_bytes", "peak_reserved_bytes", "steady_allocated_bytes", "steady_reserved_bytes",
+            "split", "inputs_sha256", "permit_sha256", "method_sha256", "result_sha256",
+            "run_sha256", "view_sha256", "approval_sha256"}
+    if "compact_manifest_sha256" in metrics:
+        from .native_compact import ReloadReport
+        keys.update(("compact_manifest_sha256", "physical_layers", "reload_parity"))
+        reload = metrics["reload_parity"]
+        _require(metrics["physical_layers"] == 20 and set(reload) == {f.name for f in fields(ReloadReport)}
+                 and reload["manifest_sha256"] == metrics["compact_manifest_sha256"])
+    _require(set(metrics) == keys and set(metrics["parity"]) == {f.name for f in fields(ParityReport)})
+
+
+def _native_trace(trace, packet_pin):
+    from .worker import validate_native_answer
+    _require(type(trace) is dict and set(trace) == {"id", "tokens", "layer_calls", "callback_counts", "readouts",
+                                                    "wall_ms", "cuda_event_ms", "packet_sha256", "native_answer"}
+             and type(trace["id"]) is str and type(trace["layer_calls"]) is int and trace["layer_calls"] in (20, 24, 28, 32)
+             and trace["packet_sha256"] == packet_pin and trace["readouts"] == [] and _integer(trace["tokens"], 1, 65536)
+             and all(type(trace[k]) in (int, float) and 0 <= trace[k] < math.inf for k in ("wall_ms", "cuda_event_ms")))
+    counts = trace["callback_counts"]
+    _require(type(counts) is dict and set(counts) == {"stock_calls", "prelude_calls", "block_calls", "coda_calls"}
+             and all(_integer(n, 0, 3) for n in counts.values()))
+    validate_native_answer(trace["native_answer"])
 
 
 def _outputs(run, packet, rows, attempt):
@@ -374,6 +407,17 @@ def _outputs(run, packet, rows, attempt):
                       "callback_counts"} <= set(trace))
         if attempt.permit_sha256 is not None:
             _require(trace.get("packet_sha256") == attempt.packet_sha256)
+        if attempt.mode == "public-native":
+            _native_trace(trace, attempt.packet_sha256)
+            k = packet["loop"].get("k", 1)
+            blocks = 1 if packet["loop"].get("method") == "zero_extra" else k
+            depth = 20 if "compact_recipe" in packet else 24
+            calls = (1, 0, 0, 0) if k == 1 else (0, 1, blocks, 1)
+            keys = ("stock_calls", "prelude_calls", "block_calls", "coda_calls")
+            _require(row.choices == 77 and tuple(trace["callback_counts"][key] for key in keys) == calls
+                     and type(trace["layer_calls"]) is int and trace["layer_calls"] == depth + 4*(blocks-1))
+        else:
+            _require("native_answer" not in trace)
         if ensemble is not None:
             n = 1 + int(row.group in selected)
             expected = {"stock_calls": 0, "prelude_calls": n, "block_calls": n, "coda_calls": n}
@@ -732,6 +776,9 @@ def _check_local(local, raw, doc, attempt, *, durable=False):
         elif name == "complete.json":
             _completion_binding(_json(data), attempt,
                                 {n: doc["files"][n]["sha256"] for n in ("predictions.jsonl", "trace.jsonl")})
+        elif name == "trace.jsonl" and attempt.mode == "public-native":
+            for line in io.BytesIO(data):
+                _native_trace(_json(line), attempt.packet_sha256)
 
 
 def _verified_bytes(port, attempt, destination, *, receipt_sha256=None):

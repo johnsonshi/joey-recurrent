@@ -80,13 +80,23 @@ class TransportTest(unittest.TestCase):
         a = self.discovery()
         settings = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
         mid = worker.method_sha256(settings)
-        choices = choices or ([f"synthetic option {i}" for i in range(77)] if mode == "public-development" else ["A", "B"])
-        shard = tr._encoded(dict(self.row, id="toy-" + mode, choices=choices)) + b"\n"
+        public = mode in ("public-development", "public-native")
+        choices = choices or ([f"synthetic option {i}" for i in range(77)] if public else ["A", "B"])
+        row = dict(self.row, id="toy-" + mode, prompt="Invented café case?", choices=choices)
+        shard = tr._encoded(row) + b"\n"
+        if mode == "public-native":
+            q1 = {"type": "choice", "instructions": row["prompt"], "criteria": {f"option_{i}": s for i,s in enumerate(choices)}}
+            wrapper = {"id": row["id"], "input_sha256": input_sha256(row), "payload": {"state": {}, "questions": {"q1": q1}}}
+            def line(obj):
+                return json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+            shard = line({"input": row, "native": wrapper})
         (tr.STAGED / "inputs" / (mode + ".jsonl")).write_bytes(shard)
         view = {"schema": "joey-label-free-view/v1", "split": mode, "projection": worker.PHASES[mode],
                 "inputs_sha256": tr._sha(shard), "split_manifest_sha256": "e"*64, "rows": 1, "bytes": len(shard)}
-        if mode == "public-development":
+        if public:
             view["menu_sha256"] = tr._sha(tr._encoded(choices))
+        if mode == "public-native":
+            view.update(research_inputs_sha256=tr._sha(line(row)), native_requests_sha256=tr._sha(line(wrapper)))
         view.update(view_changes or {})
         vp = worker.view_sha256(view)
         release = ({"final_freeze_sha256": "d"*64} if mode == "final" else {"approval_sha256": "c"*64})
@@ -479,21 +489,91 @@ class TransportTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "launch"):
                 worker.run(args)
 
-    def test_cpu_phase_export_and_verified_recovery_after_lost_ack(self):
-        # All three synthetic admissions drive the same existing inference path.
-        # Neither a real model nor an actual release receipt is present.
-        @dataclass
-        class Parity:
-            fixture: bool = True
+    def test_public_native_pairs_bind_inner_byte_streams_and_ordered_q1(self):
+        a = self.phase_attempt("public-native")
+        raw = tr._shard_bytes(a.mode)
+        view = json.loads(tr._admission_bytes(a.mode + "-permit.json"))["view"]
+        line = lambda obj: (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        self.assertEqual(worker.phase_rows(raw, view), [json.loads(raw)["input"]])
+        # Inner ordering (and non-ASCII UTF-8) is byte-significant, not just the JSON value.
+        for part, pin in (("input","research_inputs_sha256"), ("native","native_requests_sha256")):
+            obj = json.loads(raw)
+            obj[part] = dict(reversed(obj[part].items()))
+            cooked = line(obj)
+            v = dict(view, bytes=len(cooked), inputs_sha256=tr._sha(cooked))
+            with self.assertRaisesRegex(ValueError, "original JSONL digests"):
+                worker.phase_rows(cooked, v)
+            v[pin] = tr._sha(line(obj[part]))
+            self.assertEqual(worker.phase_rows(cooked, v), [obj["input"]])
+        for bad in ("order", "description", "prompt", "id", "digest", "state", "other_question",
+                    "type", "wrapper_extra", "pair_extra", "q1_extra", "payload_extra", "missing_option"):
+            with self.subTest(bad=bad):
+                pair = json.loads(raw)
+                wrapper = pair["native"]
+                payload = wrapper["payload"]
+                q1 = payload["questions"]["q1"]
+                if bad == "order": q1["criteria"] = dict(sorted(q1["criteria"].items()))
+                elif bad == "description": q1["criteria"]["option_3"] = "different"
+                elif bad == "prompt": q1["instructions"] = "different"
+                elif bad == "id": wrapper["id"] = "different"
+                elif bad == "digest": wrapper["input_sha256"] = "d"*64
+                elif bad == "state": payload["state"] = {"unexpected": True}
+                elif bad == "other_question": payload["questions"]["q2"] = q1
+                elif bad == "type": q1["type"] = "score"
+                elif bad == "wrapper_extra": wrapper["extra"] = True
+                elif bad == "pair_extra": pair["extra"] = True
+                elif bad == "q1_extra": q1["extra"] = True
+                elif bad == "payload_extra": payload["model"] = "different"
+                else: del q1["criteria"]["option_76"]
+                cooked = line(pair)
+                v = dict(view, bytes=len(cooked), inputs_sha256=tr._sha(cooked), native_requests_sha256=tr._sha(line(wrapper)))
+                with self.assertRaises(ValueError):
+                    worker.phase_rows(cooked, v)
 
+    def test_native_trace_refuses_missing_spliced_or_untyped_fields(self):
+        pin = "d"*64
+        answer = {"type": "choice", "choice": "option_76", "probabilities": dict.fromkeys(worker.NATIVE_OPTIONS,.013)}
+        trace = {"id": "toy", "tokens": 100, "layer_calls": 24, "readouts": [], "wall_ms": 1, "cuda_event_ms": .2,
+                 "packet_sha256": pin, "native_answer": answer,
+                 "callback_counts": {"stock_calls":1, "prelude_calls":0, "block_calls":0, "coda_calls":0}}
+        tr._native_trace(trace, pin)  # rounded native mass 1.001 is valid even though >1e-6 from one.
+        for bad in (dict(trace, packet_sha256="e"*64), dict(trace, payload={}), dict(trace, readouts=[{}]),
+                    {k:v for k,v in trace.items() if k != "native_answer"},
+                    *(dict(trace, native_answer=dict(answer, **update)) for update in (
+                        {"type":"score"}, {"choice":"option_77"}, {"extra":"debug"}, {"probabilities":{"option_0":1}},
+                        *({"probabilities":dict(answer["probabilities"], option_0=x)} for x in (
+                            True, -0.1, float("nan"), float("inf"), 0.9)),
+                        {"probabilities":dict(answer["probabilities"], extra=0)}))):
+            with self.assertRaises(ValueError):
+                tr._native_trace(bad, pin)
+
+    def test_cpu_phase_export_and_verified_recovery_after_lost_ack(self):
+        from joey_research.native import ParityReport
         observations = []
+        events = []
         def branches(state, qs, *, window):
-            labels = tuple(qs["decision"]["criteria"])
+            qid, = qs
+            labels = tuple(qs[qid]["criteria"])
             observations.append(len(labels))
-            return {"decision": SimpleNamespace(labels=labels, layout=SimpleNamespace(input_ids=(1,)),
-                    inference_context=contextlib.nullcontext, stock=lambda: 0,
-                    probabilities=lambda _: [1/len(labels)]*len(labels))}
-        native = SimpleNamespace(branches=branches, verify_parity=lambda **kw: Parity())
+            if qid == "q1":
+                self.assertEqual(state, {})
+                self.assertEqual(qs[qid]["instructions"], "Invented café case?")
+                self.assertEqual(list(qs[qid]["criteria"].items()), [(f"option_{i}", f"synthetic option {i}") for i in range(77)])
+            logits = object()
+            def probs(arg):
+                self.assertIs(arg, logits)
+                events.append("vector")
+                return [1/len(labels)] * len(labels)
+            def decode(arg):
+                self.assertIs(arg, logits)
+                events.append("decode")
+                # Deliberately not the first argmax; native output need not be the research vector.
+                return {"type": "choice", "choice": labels[-1], "probabilities": dict.fromkeys(labels, 0.013)}
+            return {qid: SimpleNamespace(labels=labels, layout=SimpleNamespace(input_ids=(1,)),
+                    inference_context=contextlib.nullcontext, stock=lambda: events.append("forward") or logits,
+                    probabilities=probs, decode=decode)}
+        native = SimpleNamespace(branches=branches, verify_parity=lambda **kw: ParityReport(
+            (8,12), 1, ("sequential",), 0., 0., 0., 0., True, .05, .005, 1e-5))
         cuda = SimpleNamespace(device_count=lambda: 1, is_bf16_supported=lambda: True, get_device_properties=lambda _: (
             SimpleNamespace(name="fixture A100", major=8, minor=0, total_memory=42)), synchronize=lambda: None,
             reset_peak_memory_stats=lambda: None, Event=lambda **kw: SimpleNamespace(record=lambda: None, elapsed_time=lambda _: 1),
@@ -516,8 +596,36 @@ class TransportTest(unittest.TestCase):
                     a = self.phase_attempt(mode)
                     status, files = tr._result(a)
                     self.assertEqual(status, "complete")
-                    self.assertEqual(observations.pop(), 77 if mode == "public-development" else 2)
+                    self.assertEqual(observations.pop(), 77 if mode in ("public-development", "public-native") else 2)
                     self.assertFalse(observations)  # No extra real-row warmup.
+                    if mode == "public-native":
+                        trace = json.loads(files["trace.jsonl"])
+                        self.assertEqual(trace["native_answer"]["choice"], "option_76")
+                        self.assertEqual(trace["native_answer"]["probabilities"]["option_0"], .013)
+                        self.assertEqual(trace["layer_calls"], 24)
+                        self.assertEqual(trace["callback_counts"]["stock_calls"], 1)
+                        self.assertEqual(json.loads(files["predictions.jsonl"])["probs"], [1/77]*77)
+                        self.assertEqual(events, ["forward", "vector", "decode"])
+                        packet, _, _, inputs = tr._phase_inputs(a.phase_gate())
+                        bound = {r["id"]: tr._Decision(input_sha256(r), 77, r["task"], r["group_id"]) for r in inputs}
+                        out = tr.WORK / "run/out"
+                        with tr._directory(out.parent) as run:
+                            for bad in (dict(trace, request_body={}), dict(trace, layer_calls=32),
+                                        dict(trace, native_answer=dict(trace["native_answer"], choice="foreign"))):
+                                # Even resealing these bytes under the right packet doesn't make them exportable.
+                                changed = tr._encoded(bad) + b"\n"
+                                m = json.loads(files["complete.json"])
+                                m["result_sha256"]["trace.jsonl"] = tr._sha(changed)
+                                (out / "trace.jsonl").write_bytes(changed)
+                                (out / "complete.json").write_bytes(tr._encoded(m))
+                                with self.assertRaises(ValueError):
+                                    tr._outputs(run, packet, bound, a)
+                        (out / "trace.jsonl").write_bytes(files["trace.jsonl"])
+                        (out / "complete.json").write_bytes(files["complete.json"])
+                    else:
+                        self.assertEqual(events, ["forward", "vector"])
+                        self.assertNotIn("native_answer", json.loads(files["trace.jsonl"]))
+                    events.clear()
                     routes = tr._publication(a, status, files)
                     args = dict(mode=a.mode, nonce=a.nonce, admit_before=a.admit_before, hard_stop=a.hard_stop,
                                 packet_sha256=a.packet_sha256, requirements_sha256=a.requirements_sha256,

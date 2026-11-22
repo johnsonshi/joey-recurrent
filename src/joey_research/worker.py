@@ -20,9 +20,11 @@ from .loop import LoopPlan, run_loop
 from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
+          "public-native": "banking77-original-train-native77/v1",
           "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
+NATIVE_OPTIONS = tuple(f"option_{i}" for i in range(77))
 
 
 def compact_recipe(name: str) -> dict:
@@ -54,6 +56,33 @@ def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
     return row["prompt"], {"decision": {"type": "choice", "instructions": "Select the best option.", "criteria": criteria}}
 
 
+def public_native_payload(row):
+    """Reconstruct only the q1 payload whose equivalence was checked at admission."""
+    input_sha256(row)
+    criteria = dict(zip(NATIVE_OPTIONS, row["choices"], strict=True))
+    return {"state": {}, "questions": {"q1": {"type": "choice", "instructions": row["prompt"], "criteria": criteria}}}
+
+
+def validate_native_answer(answer):
+    if (type(answer) is not dict or set(answer) != {"type", "choice", "probabilities"}
+            or answer["type"] != "choice" or answer["choice"] not in NATIVE_OPTIONS):
+        raise ValueError("invalid typed q1 choice")
+    p = answer["probabilities"]
+    if (type(p) is not dict or p.keys() != set(NATIVE_OPTIONS)
+            or not all(type(v) in (float, int) and 0 <= v <= 1 for v in p.values())
+            or abs(math.fsum(p.values()) - 1) > 0.01):
+        raise ValueError("invalid typed q1 probability map")
+
+
+def _native_arm(window, plan, compact):
+    allowed = {(1, "naive"), (2, "naive")}
+    if not compact:
+        allowed.update({(2, "zero_extra"), (3, "euler")})
+    if tuple(window) != (8, 12) or plan.readout != "final" or (plan.k, plan.method) not in allowed:
+        raise ValueError("outside the frozen public-native comparison")
+    return compact, plan.k, plan.method
+
+
 def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
                    policy=None, split="discovery") -> tuple[dict, dict]:
     if split not in ("discovery", "selection", *PHASES):
@@ -61,9 +90,17 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
     order = tuple(range(len(row["choices"])))
     if reverse:
         order = order[::-1]
-    state, questions = choice_request(row, order)
-    branch = native.branches(state, questions, window=window)["decision"]
-    if tuple(branch.labels) != tuple(questions["decision"]["criteria"]):
+    if split == "public-native":
+        if reverse or policy is not None:
+            raise ValueError("original q1 requires the approved forward method")
+        _native_arm(window, plan, hasattr(native, "physical_to_source"))
+        payload = public_native_payload(row)
+        state, questions, qid = payload["state"], payload["questions"], "q1"
+    else:
+        state, questions = choice_request(row, order)
+        qid = "decision"
+    branch = native.branches(state, questions, window=window)[qid]
+    if tuple(branch.labels) != tuple(questions[qid]["criteria"]):
         raise ValueError("native option order differs from the request")
 
     def original_order(p):
@@ -78,6 +115,11 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
         result = run_loop(plan, branch)
         counts = result.counts
         p = original_order(branch.probabilities(result.logits))
+        if split == "public-native":
+            # Native typed decoding is a second read of these logits, not another model invocation.
+            answer = branch.decode(result.logits)
+            validate_native_answer(answer)
+            more["native_answer"] = answer
         trace = [{"block_evaluations": r.block_evaluations, "kind": r.kind,
                   "probs": original_order(branch.probabilities(r.logits))} for r in result.readouts]
     else:
@@ -233,11 +275,23 @@ def selection_packet(raw: bytes, nomination: bytes, *, packet_sha256: str, nomin
 def _nominated(obj, methods, envelope):
     if type(methods) is not dict or not 1 <= len(methods) <= 256 or obj["method_sha256"] not in methods:
         raise ValueError("no authorized method")
+    arms, compact_pins = set(), set()
     for key, settings in methods.items():
         if key != method_sha256(settings):
             raise ValueError("invalid nominated method ID")
         if obj["split"] != "refinement" and settings.get("compact_recipe") in REFINEMENT_RECIPES:
             raise ValueError("refinement-only recipe outside its authorized phase")
+        if obj["split"] == "public-native":
+            window, plan = _settings(settings)
+            compact = "compact_manifest_sha256" in settings
+            if compact:
+                compact_pins.add(settings["compact_manifest_sha256"])
+            arm = _native_arm(window, plan, compact)
+            if (settings["reverse"] or {"policy", "order_ensemble"} & settings.keys()
+                    or (compact and settings.get("compact_recipe") != "select-20")
+                    or arm in arms or len(compact_pins) > 1):
+                raise ValueError("outside the frozen public-native comparison")
+            arms.add(arm)
     declared = {k: v for k, v in obj.items() if k not in envelope}
     window, plan = _settings(declared)
     # Comparing canonical bytes also distinguishes true/1, 1/1.0, and a
@@ -308,13 +362,15 @@ def phase_packet(raw, permit_bytes, gate: PhaseGate):
         raise TimeoutError
     view = permit["view"]
     fields = {"schema", "split", "projection", "inputs_sha256", "split_manifest_sha256", "rows", "bytes"}
-    if gate.mode == "public-development":
+    if gate.mode in ("public-development", "public-native"):
         fields.add("menu_sha256")
+    if gate.mode == "public-native":
+        fields.update(("research_inputs_sha256", "native_requests_sha256"))
     if (type(view) is not dict or set(view) != fields or view_sha256(view) != gate.view_sha256
             or view["schema"] != "joey-label-free-view/v1" or view["split"] != gate.mode
             or view["projection"] != PHASES[gate.mode]
             or not all(_pin(view[k]) for k in fields if k.endswith("_sha256"))
-            or type(view["rows"]) is not int or not 0 < view["rows"] <= 20000
+            or type(view["rows"]) is not int or not 0 < view["rows"] <= (512 if gate.mode == "public-native" else 20000)
             or type(view["bytes"]) is not int or not 0 < view["bytes"] <= 64 * 2**20):
         raise ValueError("invalid phase view")
     envelope = _SELECTION_ENVELOPE | {"view_sha256"}
@@ -327,23 +383,51 @@ def phase_packet(raw, permit_bytes, gate: PhaseGate):
     return (*_nominated(obj, permit["methods"], envelope), view)
 
 
+def _upstream_line(obj):
+    return (json.dumps(obj, ensure_ascii=False, sort_keys=False, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
+
+
+def _original_pair(pair):
+    if type(pair) is not dict or set(pair) != {"input", "native"}:
+        raise ValueError("expected a blinded research/native pair")
+    row, wrapper = pair["input"], pair["native"]
+    payload = public_native_payload(row)
+    if (type(wrapper) is not dict or set(wrapper) != {"id", "input_sha256", "payload"} or wrapper["id"] != row["id"]
+            or wrapper["input_sha256"] != input_sha256(row) or wrapper["payload"] != payload
+            or tuple(wrapper["payload"]["questions"]["q1"]["criteria"]) != NATIVE_OPTIONS):
+        raise ValueError("original q1 and research row disagree")
+    return row, wrapper
+
+
 def phase_rows(raw, view):
     from .transport import _json
     if len(raw) != view["bytes"] or hashlib.sha256(raw).hexdigest() != view["inputs_sha256"]:
         raise ValueError("phase shard differs")
     seen, rows = set(), []
+    paired = view["split"] == "public-native"
+    if paired:
+        research, native = hashlib.sha256(), hashlib.sha256()
     for line in BytesIO(raw):
         row = _json(line)
-        input_sha256(row)  # Same label-free schema as discovery; no projection/label stripping here.
+        if paired:
+            row, wrapper = _original_pair(row)
+            # Hash the originals in their source order, never the reconstructed request.
+            research.update(_upstream_line(row))
+            native.update(_upstream_line(wrapper))
+        else:
+            input_sha256(row)
         if len(rows) >= view["rows"] or row["id"] in seen or len(row["choices"]) > 255:
             raise ValueError("phase row inventory differs")
-        if view["split"] == "public-development" and (
+        if view["split"] in ("public-development", "public-native") and (
                 len(row["choices"]) != 77 or hashlib.sha256(_canonical(row["choices"])).hexdigest() != view["menu_sha256"]):
             raise ValueError("public train requires the approved ordered 77-choice research menu")
         seen.add(row["id"])
         rows.append(row)
     if len(rows) != view["rows"]:
         raise ValueError("phase row count differs")
+    if paired and (research.hexdigest() != view["research_inputs_sha256"]
+                   or native.hexdigest() != view["native_requests_sha256"]):
+        raise ValueError("recovered original JSONL digests differ")
     return rows
 
 
@@ -411,8 +495,9 @@ def run(args) -> None:
         rows = [json.loads(s) for s in _load(args.inputs, obj["inputs_sha256"]).splitlines()]
     if not 0 < len(rows) <= 20000 or len({r["id"] for r in rows}) != len(rows):
         raise ValueError("invalid tier or duplicate decision IDs")
-    for row in rows:
-        choice_request(row, tuple(range(len(row["choices"]))))
+    if phase != "public-native":  # phase_rows already proved the original q1 for every paired row.
+        for row in rows:
+            choice_request(row, tuple(range(len(row["choices"]))))
     ensemble = obj.get("order_ensemble")
     split = obj["split"]
     if ensemble is not None:
