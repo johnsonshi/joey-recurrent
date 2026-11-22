@@ -42,7 +42,10 @@ def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
     return row["prompt"], {"decision": {"type": "choice", "instructions": "Select the best option.", "criteria": criteria}}
 
 
-def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False, policy=None) -> tuple[dict, dict]:
+def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
+                   policy=None, split="discovery") -> tuple[dict, dict]:
+    if split not in ("discovery", "selection"):
+        raise ValueError("unsupported inference split")
     order = tuple(range(len(row["choices"])))
     if reverse:
         order = order[::-1]
@@ -68,7 +71,7 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
     else:
         if branch.temperature != 1:
             raise ValueError("raw-logit policy requires the pinned uncalibrated readout")
-        decision = actuate(plan, branch, lambda: SlotOrder("discovery",digest,tuple(branch.labels)), policy)
+        decision = actuate(plan, branch, lambda: SlotOrder(split,digest,tuple(branch.labels)), policy)
         counts = decision.executed
         p = original_order(decision.probabilities)
         trace = []
@@ -99,19 +102,61 @@ def _policy(obj):
     return Policy(**cfg)
 
 
-def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
-    obj = json.loads(raw)
-    required = {"schema", "split", "inputs_sha256", "window", "loop", "reverse", "deadline_utc"}
-    if not required <= set(obj) <= (required | {"compact_manifest_sha256","compact_recipe","policy"}) or obj["schema"] != 1:
-        raise ValueError("unexpected worker packet")
-    if "compact_manifest_sha256" in obj and not re.fullmatch(r"[0-9a-f]{64}", obj["compact_manifest_sha256"]):
+_ENVELOPE = {"schema", "split", "inputs_sha256", "deadline_utc"}
+_SELECTION_ENVELOPE = _ENVELOPE | {"permit_sha256", "method_sha256"}
+_REQUIRED_SETTINGS = {"window", "loop", "reverse"}
+_SETTINGS = _REQUIRED_SETTINGS | {"policy", "compact_recipe", "compact_manifest_sha256", "order_ensemble"}
+PERMIT_LIMIT = 128 * 1024
+
+
+def _pin(value):
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _fraction(cfg):
+    if (type(cfg) is not dict or set(cfg) != {"numerator", "denominator", "seed"}
+            or any(type(v) is not int for v in cfg.values())
+            or not 1 <= cfg["denominator"] <= 10000 or not 0 <= cfg["numerator"] <= cfg["denominator"]
+            or not 0 <= cfg["seed"] < 2**32):
+        raise ValueError("invalid group spend budget")
+    return cfg["numerator"], cfg["denominator"], cfg["seed"]
+
+
+def ensemble_groups(task_groups, config, *, split):
+    """Choose whole groups from (task, group_id) pairs, independent of rows, labels and scores."""
+    numerator, denominator, seed = _fraction(config)
+    if split not in ("discovery", "selection"):
+        raise ValueError("unsupported spend split")
+    owners, tasks = {}, {}
+    for task, group in task_groups:
+        if owners.setdefault(group, task) != task:
+            raise ValueError("one group spans tasks")
+        tasks.setdefault(task, set()).add(group)
+    quotas = {t: divmod(len(groups) * numerator, denominator) for t, groups in tasks.items()}
+    left = len(owners) * numerator // denominator - sum(q for q, _ in quotas.values())
+    extra = set(sorted(tasks, key=lambda t: (-quotas[t][1], t))[:left])
+    selected = set()
+    for task, groups in tasks.items():
+        def rank(group):
+            key = ["joey-order-ensemble/v1", split, seed, task, group]
+            return hashlib.sha256(_canonical(key)).digest(), group
+        selected.update(sorted(groups, key=rank)[:quotas[task][0] + (task in extra)])
+    return selected
+
+
+def _settings(obj):
+    if type(obj) is not dict or not _REQUIRED_SETTINGS <= obj.keys() <= _SETTINGS or type(obj["reverse"]) is not bool:
+        raise ValueError("unexpected inference settings")
+    if "compact_manifest_sha256" in obj and not _pin(obj["compact_manifest_sha256"]):
         raise ValueError("invalid compact receipt")
     if "compact_recipe" in obj:
         compact_recipe(obj["compact_recipe"])
         if "compact_manifest_sha256" not in obj:
             raise ValueError("derived compact payload needs an independent coordinator pin")
-    if obj["split"] != "discovery" or type(obj["reverse"]) is not bool:
-        raise ValueError("worker only accepts explicit discovery packets")
     w = obj["window"]
     if not isinstance(w, list) or len(w) != 2 or not all(type(i) is int for i in w) or not 0 <= w[0] < w[1] < 24:
         raise ValueError("invalid stock model window")
@@ -124,13 +169,92 @@ def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
         _policy(obj["policy"])
         if plan.method not in ("naive","damped_extra") or plan.readout != "final":
             raise ValueError("live pooling needs completed repeats; use separate diagnostic packets for recording")
-    return obj, (w[0], w[1]), plan
+    if "order_ensemble" in obj:
+        _fraction(obj["order_ensemble"])
+        if (plan != LoopPlan(k=2, method="zero_extra") or obj["reverse"]
+                or set(obj["loop"]) - {"k", "method", "readout"}
+                or {"compact_recipe", "compact_manifest_sha256", "policy"} & obj.keys()):
+            raise ValueError("order ensemble needs forward-order full-model zero-extra split passes")
+    return (w[0], w[1]), plan
+
+
+def method_sha256(settings: dict) -> str:
+    """Digest of canonical *declared* worker settings, without default substitution."""
+    _settings(settings)
+    return hashlib.sha256(_canonical(settings)).hexdigest()
+
+
+def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
+    """Legacy discovery entry point; never route on a self-declared packet split."""
+    obj = json.loads(raw)
+    if not isinstance(obj, dict) or not _ENVELOPE <= obj.keys() or obj["schema"] != 1:
+        raise ValueError("unexpected worker packet")
+    if obj["split"] != "discovery":
+        raise ValueError("worker only accepts explicit discovery packets")
+    return obj, *_settings({k: v for k, v in obj.items() if k not in _ENVELOPE})
+
+
+def selection_packet(raw: bytes, nomination: bytes, *, packet_sha256: str, nomination_sha256: str):
+    """Verify the two *independent* byte pins and bind the entire selection method."""
+    from .transport import _json
+    if (len(raw) > 8192 or len(nomination) > PERMIT_LIMIT or not _pin(packet_sha256) or not _pin(nomination_sha256)
+            or hashlib.sha256(raw).hexdigest() != packet_sha256
+            or hashlib.sha256(nomination).hexdigest() != nomination_sha256):
+        raise ValueError("unbound selection admission")
+    obj, permit = _json(raw), _json(nomination)
+    if (type(permit) is not dict or set(permit) != {"schema", "split", "inputs_sha256", "split_manifest_sha256", "methods"}
+            or permit["schema"] != "joey-promotion-permit/v1" or permit["split"] != "selection"
+            or not _pin(permit["inputs_sha256"]) or not _pin(permit["split_manifest_sha256"])
+            or type(permit["methods"]) is not dict or not 1 <= len(permit["methods"]) <= 256):
+        raise ValueError("invalid selection permit")
+    if (type(obj) is not dict or not _SELECTION_ENVELOPE <= obj.keys()
+            or type(obj["schema"]) is not int or obj["schema"] != 1 or obj["split"] != "selection"
+            or type(obj["deadline_utc"]) is not int or obj["deadline_utc"] <= 0
+            or permit["inputs_sha256"] != obj["inputs_sha256"] or obj["permit_sha256"] != nomination_sha256
+            or not _pin(obj["method_sha256"]) or obj["method_sha256"] not in permit["methods"]):
+        raise ValueError("selection packet does not match its permit")
+    for key, settings in permit["methods"].items():
+        if key != method_sha256(settings):
+            raise ValueError("invalid nominated method ID")
+    declared = {k: v for k, v in obj.items() if k not in _SELECTION_ENVELOPE}
+    window, plan = _settings(declared)
+    # Comparing canonical bytes also distinguishes true/1, 1/1.0, and a
+    # missing field vs an explicitly supplied default.
+    if _canonical(declared) != _canonical(permit["methods"][obj["method_sha256"]]):
+        raise ValueError("selection settings differ from the nominated method")
+    return obj, window, plan
+
+
+def _measure_ensemble(native, row, window, plan, split, *, second):
+    pred, trace = measure_choice(native, row, window, plan, split=split)
+    if second:
+        rev, other = measure_choice(native, row, window, plan, split=split, reverse=True)
+        pred["probs"] = [(a + b) / 2 for a, b in zip(pred["probs"], rev["probs"], strict=True)]
+        for key in ("tokens", "layer_calls"):
+            trace[key] += other[key]
+        for key, count in other["callback_counts"].items():
+            trace["callback_counts"][key] += count
+    trace["ensemble_calls"] = trace["forward_calls"] = 2 if second else 1
+    return pred, trace
 
 
 def run(args) -> None:
     if any(os.environ.get(k) != "1" for k in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")):
         raise ValueError("offline loader flags are required")
-    obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
+    selection = getattr(args, "selection", False)
+    nomination_pin = getattr(args, "nomination_sha256", None)
+    if selection:
+        from . import transport
+        if (not _pin(nomination_pin) or args.packet != transport.ADMISSION / "packet.json"
+                or args.inputs != transport.STAGED / "inputs/selection.jsonl"
+                or args.model_dir != transport.STAGED / "model"
+                or args.compact_dir not in (None, transport.STAGED / "compact")):
+            raise ValueError("selection requires fixed verified mounts")
+        obj, window, plan = transport._read_selection_packet(args.packet_sha256, nomination_pin)
+    else:
+        if nomination_pin is not None:
+            raise ValueError("discovery cannot consume a nomination")
+        obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
     if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 30 * 3600:
         raise ValueError("expired or unbounded worker deadline")
     # The coordinator binds a stricter absolute cutoff to this exact packet.
@@ -140,11 +264,24 @@ def run(args) -> None:
     if remaining <= 0:
         raise ValueError("worker deadline elapsed before start")
     signal.setitimer(signal.ITIMER_REAL, remaining)
-    rows = [json.loads(s) for s in _load(args.inputs, obj["inputs_sha256"]).splitlines()]
+    if selection:
+        shard = transport._shard_bytes("selection")
+        if hashlib.sha256(shard).hexdigest() != obj["inputs_sha256"]:
+            raise ValueError("selection shard differs from permit")
+        rows = [transport._json(s) for s in shard.splitlines()]
+        del shard
+    else:
+        rows = [json.loads(s) for s in _load(args.inputs, obj["inputs_sha256"]).splitlines()]
     if not 0 < len(rows) <= 20000 or len({r["id"] for r in rows}) != len(rows):
         raise ValueError("invalid tier or duplicate decision IDs")
     for row in rows:
         choice_request(row, tuple(range(len(row["choices"]))))
+    ensemble = obj.get("order_ensemble")
+    split = obj["split"]
+    if ensemble is not None:
+        selected = ensemble_groups(((r["task"], r["group_id"]) for r in rows), ensemble, split=split)
+        spend = {"groups": len({r["group_id"] for r in rows}), "extra_groups": len(selected),
+                 "forward_calls": 0, "layer_calls": 0, "coda_calls": 0}
     if os.environ.get("TMPDIR") == "/work/tmp":
         Path("/work/tmp").mkdir(mode=0o700, exist_ok=True)
     import torch
@@ -180,28 +317,45 @@ def run(args) -> None:
         native = NativeJoey.load(args.model_dir)
     report = native.verify_parity(window=window)
     policy = _policy(obj["policy"]) if "policy" in obj else None
-    measure_choice(native, rows[0], window, plan, reverse=obj["reverse"], policy=policy)
+    # Parity uses fixed public cases. Don't observe any extra study row for
+    # promotion or spend controls; retain the existing discovery warmup otherwise.
+    if not selection and ensemble is None:
+        measure_choice(native, rows[0], window, plan, reverse=obj["reverse"], policy=policy, split=split)
     torch.cuda.synchronize()
     warmup_s = time.perf_counter() - begin
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     times = []
     outputs = [args.output / "predictions.partial", args.output / "trace.partial"]
-    with outputs[0].open("x") as predictions, outputs[1].open("x") as traces:
+    names = ("predictions.jsonl", "trace.jsonl")
+    digests = {name: hashlib.sha256() for name in names} if selection else {}
+    with outputs[0].open("xb") as predictions, outputs[1].open("xb") as traces:
         for row in rows:
             torch.cuda.synchronize()
             wall = time.perf_counter_ns()
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            pred, diagnostic = measure_choice(native, row, window, plan, reverse=obj["reverse"], policy=policy)
+            if ensemble is None:
+                pred, diagnostic = measure_choice(native, row, window, plan, reverse=obj["reverse"],
+                                                  policy=policy, split=split)
+            else:
+                pred, diagnostic = _measure_ensemble(native, row, window, plan, split, second=row["group_id"] in selected)
+                spend["forward_calls"] += diagnostic["forward_calls"]
+                spend["layer_calls"] += diagnostic["layer_calls"]
+                spend["coda_calls"] += diagnostic["callback_counts"]["coda_calls"]
+            if selection:
+                diagnostic["packet_sha256"] = args.packet_sha256
             end.record()
             torch.cuda.synchronize()
             elapsed = (time.perf_counter_ns() - wall) / 1e6
             diagnostic.update(wall_ms=elapsed, cuda_event_ms=start.elapsed_time(end))
             times.append(elapsed)
-            for f, rec in ((predictions, pred), (traces, diagnostic)):
-                f.write(json.dumps(rec, allow_nan=False, separators=(",", ":")) + "\n")
+            for name, f, rec in zip(names, (predictions, traces), (pred, diagnostic), strict=True):
+                line = (json.dumps(rec, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
+                f.write(line)
+                if selection:
+                    digests[name].update(line)
                 f.flush()
                 os.fsync(f.fileno())
     duration = time.perf_counter() - t0
@@ -216,7 +370,12 @@ def run(args) -> None:
     if "compact_manifest_sha256" in obj:
         info.update(compact_manifest_sha256=obj["compact_manifest_sha256"], reload_parity=asdict(native.reload_report),
                     physical_layers=len(native.physical_to_source))
-    for f, name in zip(outputs, ("predictions.jsonl", "trace.jsonl"), strict=True):
+    if selection:
+        info.update((k, obj[k]) for k in ("split", "inputs_sha256", "permit_sha256", "method_sha256"))
+        info["result_sha256"] = {name: digest.hexdigest() for name, digest in digests.items()}
+    if ensemble is not None:
+        info["compute_spend"] = spend
+    for f, name in zip(outputs, names, strict=True):
         f.rename(args.output/name)
     with (args.output/"complete.json").open("x") as f:
         json.dump(info, f, allow_nan=False)
@@ -246,13 +405,15 @@ def _quiet_native():
             os.close(original)
 
 
-def main():
+def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("packet", "inputs", "model-dir", "output"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--compact-dir", type=Path)
     p.add_argument("--packet-sha256", required=True)
-    args = p.parse_args()
+    p.add_argument("--selection", action="store_true")
+    p.add_argument("--nomination-sha256")
+    args = p.parse_args(argv)
     try:
         with _quiet_native():
             run(args)

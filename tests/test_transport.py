@@ -15,11 +15,12 @@ import sys
 import threading
 import time
 import unittest
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from joey_research import transport as tr
+from joey_research import worker
 from joey_research.evaluation import input_sha256
 
 
@@ -56,6 +57,24 @@ class TransportTest(unittest.TestCase):
         (tr.ADMISSION / "packet.json").write_bytes(packet_raw)
         return replace(self.probe, mode="discovery", packet_sha256=tr._sha(packet_raw),
                        requirements_sha256=tr._sha(requirements))
+
+    def selection(self):
+        a = self.discovery()  # Leave a different discovery.jsonl present throughout.
+        groups = ("alpha", "alpha", "beta", "gamma", "delta")
+        rows = [dict(self.row, id=str(i), prompt=f"Menu {i}?", group_id=g, task="A" if i < 3 else "B")
+                for i, g in enumerate(groups)]
+        raw = b"".join(tr._encoded(r) + b"\n" for r in rows)
+        (tr.STAGED / "inputs/selection.jsonl").write_bytes(raw)
+        settings = {"window": [8, 12], "loop": {"k": 2, "method": "zero_extra"}, "reverse": False,
+                    "order_ensemble": {"numerator": 1, "denominator": 2, "seed": 42}}
+        mid = worker.method_sha256(settings)
+        nom = tr._encoded({"schema": "joey-promotion-permit/v1", "split": "selection", "inputs_sha256": tr._sha(raw),
+                           "split_manifest_sha256": "c"*64, "methods": {mid: settings}})
+        (tr.ADMISSION / "nomination.json").write_bytes(nom)
+        packet = tr._encoded(dict(settings, schema=1, split="selection", permit_sha256=tr._sha(nom), method_sha256=mid,
+                                  inputs_sha256=tr._sha(raw), deadline_utc=a.hard_stop))
+        (tr.ADMISSION / "packet.json").write_bytes(packet)
+        return replace(a, mode="selection", permit_sha256=tr._sha(nom), packet_sha256=tr._sha(packet)), rows
 
     @staticmethod
     def probe_doc():
@@ -218,6 +237,171 @@ class TransportTest(unittest.TestCase):
         routes = tr._publication(attempt, status, files)
         (tr.WORK / "run/out/trace.jsonl").write_bytes(b"changed")
         self.assertEqual(routes[b"/file/trace.jsonl"], (expected["trace.jsonl"], tr._sha(expected["trace.jsonl"])))
+
+    def test_selection_cpu_worker_through_export_and_local_collection(self):
+        a, rows = self.selection()
+        calls = []
+        callbacks = []
+
+        @dataclass
+        class FixtureParity:
+            fixture: bool = True
+
+        def branches(state, questions, *, window):
+            labels = tuple(questions["decision"]["criteria"])
+            calls.append((state, labels))
+            self.assertEqual(window, (8, 12))
+            # Always favor the first POSITION. Only a second native call on
+            # genuinely reversed criteria will average to a tie after remapping.
+            def observed(kind):
+                callbacks.append((state, labels, kind))
+                return 1
+            branch = SimpleNamespace(labels=labels, layout=SimpleNamespace(input_ids=(1, 2)),
+                                     prelude=lambda: observed("prelude"), block=lambda h, s: observed("block"),
+                                     coda=lambda h, s: observed("coda"),
+                                     probabilities=lambda _: (0.75, 0.25), fresh_state=object,
+                                     inference_context=contextlib.nullcontext)
+            return {"decision": branch}
+
+        native = SimpleNamespace(branches=branches, verify_parity=lambda **kw: FixtureParity())
+        prop = SimpleNamespace(name="Fixture A100", major=8, minor=0, total_memory=100)
+        cuda = SimpleNamespace(get_device_properties=lambda i: prop, device_count=lambda: 1, is_bf16_supported=lambda: True,
+                               Event=lambda **kw: SimpleNamespace(record=lambda: None, elapsed_time=lambda end: 1),
+                               synchronize=lambda: None, reset_peak_memory_stats=lambda: None,
+                               **{k: lambda: 1 for k in ("memory_allocated", "memory_reserved",
+                                                         "max_memory_allocated", "max_memory_reserved")})
+
+        def phase(a, argv, *, cwd, installed):
+            if installed:
+                self.assertNotIn(str(tr.STAGED / "inputs/discovery.jsonl"), argv)
+                self.assertIn(str(tr.STAGED / "inputs/selection.jsonl"), argv)
+                self.assertEqual(argv[argv.index("--nomination-sha256") + 1], a.permit_sha256)
+                worker.main(argv[argv.index("joey_research.worker") + 1:])
+            else:
+                self.assertIn("pip", argv)  # Never install, even fixture wheels.
+
+        with contextlib.ExitStack() as s:
+            s.enter_context(patch.dict(sys.modules, torch=SimpleNamespace(cuda=cuda)))
+            s.enter_context(patch("joey_research.native.NativeJoey.load", return_value=native))
+            s.enter_context(patch.dict(os.environ, {k: "1" for k in (
+                "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")}, clear=True))
+            for module, name in ((signal, "signal"), (signal, "setitimer"), (os, "umask")):
+                s.enter_context(patch.object(module, name))
+            s.enter_context(patch.object(tr, "_phase", side_effect=phase))
+            status, files = tr._result(a)
+        routes = tr._publication(a, status, files)
+        dest = self.root / "promotion-result"
+        exits = []
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            server = threading.Thread(target=lambda: exits.append(tr._serve(listener, a, routes, status)), daemon=True)
+            server.start()
+            receipt = tr.collect(listener.getsockname()[1], dest, mode="selection", nonce=a.nonce,
+                                 admit_before=a.admit_before, hard_stop=a.hard_stop, packet_sha256=a.packet_sha256,
+                                 requirements_sha256=a.requirements_sha256, permit_sha256=a.permit_sha256)
+            server.join(2)
+        self.assertEqual(exits, [0])
+        self.assertEqual((receipt["mode"], receipt["status"], receipt["permit_sha256"]), ("selection", "complete", a.permit_sha256))
+        preds, traces = ([json.loads(line) for line in (dest / name).read_bytes().splitlines()]
+                         for name in ("predictions.jsonl", "trace.jsonl"))
+        selected, forwards = set(), 0
+        for row, pred, trace in zip(rows, preds, traces, strict=True):
+            observed = [labels for state, labels in calls if state == row["prompt"]]
+            n = len(observed)
+            self.assertIn(n, (1, 2))
+            self.assertEqual(observed, [("opt_0", "opt_1"), ("opt_1", "opt_0")][:n])
+            self.assertEqual([(order, kind) for state, order, kind in callbacks if state == row["prompt"]],
+                             [(order, kind) for order in observed for kind in ("prelude", "block", "coda")])
+            self.assertEqual((trace["ensemble_calls"], trace["forward_calls"], trace["layer_calls"],
+                              trace["tokens"], trace["readouts"]), (n, n, 24*n, 2*n, []))
+            self.assertEqual(trace["callback_counts"], {"prelude_calls": n, "block_calls": n, "coda_calls": n, "stock_calls": 0})
+            self.assertEqual(pred, {"id": row["id"], "input_sha256": input_sha256(row),
+                                    "probs": [0.5, 0.5] if n == 2 else [0.75, 0.25]})
+            if n == 2:
+                selected.add(row["group_id"])
+            forwards += n
+        self.assertEqual(len(selected), 2)
+        self.assertEqual([x["ensemble_calls"] for x in traces], [1 + (r["group_id"] in selected) for r in rows])
+        metrics = json.loads((dest / "complete.json").read_bytes())
+        self.assertEqual(metrics["compute_spend"], {"groups": 4, "extra_groups": 2, "forward_calls": forwards,
+                                                    "layer_calls": forwards*24, "coda_calls": forwards})
+        self.assertEqual(metrics["method_sha256"], json.loads(tr._packet_bytes())["method_sha256"])
+        # Even a correctly re-indexed manifest cannot substitute another valid
+        # prediction stream for the bytes sealed by this selection worker.
+        swapped = dict(files)
+        swapped["predictions.jsonl"] += b"\n"
+        mixed = tr._publication(a, "complete", swapped)
+        with patch.object(tr, "_exchange", side_effect=lambda p, a, target, lim: mixed[target.encode()][0]) as get:
+            with self.assertRaises(tr.TransportError):
+                tr.collect(1, self.root / "spliced", mode=a.mode, nonce=a.nonce, admit_before=a.admit_before,
+                           hard_stop=a.hard_stop, packet_sha256=a.packet_sha256,
+                           requirements_sha256=a.requirements_sha256, permit_sha256=a.permit_sha256)
+        self.assertNotIn("/ack", [c.args[2] for c in get.call_args_list])
+
+    def test_selection_child_rechecks_pins_shard_and_fixed_paths_after_parent(self):
+        with patch.dict(os.environ, {k: "1" for k in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")}), \
+                patch.object(signal, "signal"), patch.object(signal, "setitimer"), patch.dict(sys.modules, torch=None):
+            for changed in ("permit", "packet", "shard", "discovery_path", "no_pin", "no_mode", "label"):
+                with self.subTest(changed=changed):
+                    a, _ = self.selection()
+                    tr._selection(a)
+                    args = SimpleNamespace(selection=True, nomination_sha256=a.permit_sha256, packet=tr.ADMISSION / "packet.json",
+                                           packet_sha256=a.packet_sha256, inputs=tr.STAGED / "inputs/selection.jsonl",
+                                           model_dir=tr.STAGED / "model", compact_dir=None)
+                    if changed == "permit":
+                        with (tr.ADMISSION / "nomination.json").open("ab") as f:
+                            f.write(b"\n")
+                    elif changed == "packet":
+                        args.packet.write_bytes(args.packet.read_bytes() + b"\n")
+                    elif changed == "shard":
+                        args.inputs.write_bytes((tr.STAGED / "inputs/discovery.jsonl").read_bytes())
+                    elif changed == "discovery_path":
+                        args.inputs = tr.STAGED / "inputs/discovery.jsonl"
+                    elif changed == "no_pin":
+                        args.nomination_sha256 = None
+                    elif changed == "no_mode":
+                        args.selection, args.nomination_sha256 = False, None
+                    else:
+                        # Even a hash-bound synthetic row with an extra field
+                        # must not reach native import in either process.
+                        raw = tr._encoded(dict(self.row, gold_index=1)) + b"\n"
+                        args.inputs.write_bytes(raw)
+                        path = tr.ADMISSION / "nomination.json"
+                        path.write_bytes(tr._encoded(dict(json.loads(path.read_bytes()), inputs_sha256=tr._sha(raw))))
+                        args.nomination_sha256 = tr._sha(path.read_bytes())
+                        pkt = dict(json.loads(args.packet.read_bytes()), inputs_sha256=tr._sha(raw),
+                                   permit_sha256=args.nomination_sha256)
+                        args.packet.write_bytes(tr._encoded(pkt))
+                        args.packet_sha256 = tr._sha(args.packet.read_bytes())
+                        with self.assertRaises(ValueError):
+                            tr._selection(replace(a, packet_sha256=args.packet_sha256, permit_sha256=args.nomination_sha256))
+                    with self.assertRaises(ValueError):
+                        worker.run(args)
+
+    def test_no_mixed_mode_or_permit_receipts(self):
+        a, _ = self.selection()
+        discovery = replace(a, mode="discovery", permit_sha256=None)
+        with self.assertRaises(ValueError):
+            tr._discovery(discovery)
+        for bad in (lambda: replace(discovery, permit_sha256=a.permit_sha256),
+                    lambda: replace(self.probe, permit_sha256=a.permit_sha256), lambda: replace(a, permit_sha256=None)):
+            with self.assertRaises(ValueError):
+                bad()
+        for old in (discovery, self.probe):
+            self.assertNotIn("permit_sha256", old.bindings())  # No new null field on the old wire.
+        doc = json.loads(tr._publication(a, "failed", {})[b"/manifest"][0])
+        for wrong in (discovery, replace(a, permit_sha256="e"*64)):
+            with self.assertRaises(ValueError):
+                tr._validate_manifest(doc, wrong)
+        # Correct authenticated outer manifest but discovery completion bytes: no durable ACK.
+        routes = tr._publication(a, "complete", self.worker_files(a, self.row))
+        with patch.object(tr, "_exchange", side_effect=lambda p, a, target, lim: routes[target.encode()][0]) as get:
+            with self.assertRaises(tr.TransportError):
+                tr.collect(1, self.root / "mixed", mode=a.mode, nonce=a.nonce, admit_before=a.admit_before, hard_stop=a.hard_stop,
+                           packet_sha256=a.packet_sha256, requirements_sha256=a.requirements_sha256, permit_sha256=a.permit_sha256)
+        self.assertNotIn("/ack", [c.args[2] for c in get.call_args_list])
+        self.assertFalse((self.root / "mixed").exists())
 
     def test_refuses_unbound_input_labels_and_expiry_before_child(self):
         for bad in ("label", "split", "deadline", "input_pin", "packet_pin"):

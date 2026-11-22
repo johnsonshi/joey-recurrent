@@ -25,3 +25,40 @@ The manifest binds `mode`, `status`, `admit_before`, `hard_stop`, `nonce_sha256`
 * Either mode: `failed` or `timeout`, empty file map. The admission pins identify **which attempt** failed; they don't attest that its inputs passed verification.
 
 After establishing the authorized forward, call `joey_research.transport.collect(local_port, new_destination, mode=..., nonce=..., admit_before=A, hard_stop=H, packet_sha256=P, requirements_sha256=R)` (omit pins for probes). Use a fresh result directory in a private, single-writer coordinator directory. It validates the manifest and files, fsyncs them, rereads and verifies them, atomically publishes the directory and fsyncs its parent **before** sending the ACK. A lost ACK does not erase durable files; reconcile the retained bytes and exact Pod terminal evidence, never substitute a new run's receipt. ACK asserts coordinator persistence, not success of inference or independent validation of study metrics. Exit after ACK: `0` for setup/complete, `2` for failed, `124` for timeout. Hard expiry without ACK is non-success. Keep the nonce, raw outputs, paths and trace out of shared logs.
+
+## Promotion selection (new image only)
+
+```
+python -m joey_research.transport selection --admit-before A --hard-stop H \
+  --packet-sha256 P --requirements-sha256 R --nomination-sha256 N
+```
+
+Mount immutable, read-only `/admission/packet.json`, `/admission/nomination.json`, and **only the approved selection shard** at `/staged/inputs/selection.jsonl`. No labels, calibration or final data. `P` and `N` are SHA-256 of the **exact file bytes**, supplied independently by the coordinator. `nomination.json` is the worker permit, not a trial proposal or a list of scores. The coordinator must first verify that the selection shard came from the frozen split manifest and the methods came from the immutable nomination; a content hash alone does not establish either provenance.
+
+Example construction (all digest strings are lowercase hex):
+
+```python
+from joey_research.worker import method_sha256
+
+settings = {"window": [4, 8], "loop": {"k": 2}, "reverse": False}
+M = method_sha256(settings)  # 0061ab40681a47fd974e520e842a12f7c83569ac583939d88e3975c51665161b
+permit = {"schema": "joey-promotion-permit/v1", "split": "selection",
+          "inputs_sha256": S, "split_manifest_sha256": F, "methods": {M: settings}}
+# Freeze permit bytes first; N is their digest, not a field inside the permit.
+packet = {"schema": 1, "split": "selection", "inputs_sha256": S, "deadline_utc": H,
+          "permit_sha256": N, "method_sha256": M, **settings}
+```
+
+`M` hashes `json.dumps(settings, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")` **without a newline**. `settings` must contain exactly `window`, `loop`, `reverse`, plus only the optional worker fields `policy`, `compact_recipe`, `compact_manifest_sha256`, `order_ensemble` when applicable. No default expansion, field dropping, list sorting, family aliases, or int/float coercion. The permit contains exactly the five keys above, 1–256 methods, and at most 128 KiB; the packet limit remains 8192 bytes. Every method ID is rehashed, including unselected entries.
+
+The exporter verifies before installation. The child uses the existing `python -m joey_research.worker` flags with `--inputs /staged/inputs/selection.jsonl --selection --nomination-sha256 N` and independently rereads both admission files and the shard before native import. The verifier is also callable as `worker.selection_packet(packet_bytes, permit_bytes, packet_sha256=P, nomination_sha256=N)`, returning `(packet, window, loop_plan)`. A selection packet is never accepted by the discovery entry point or vice versa.
+
+Collect with `collect(port, fresh_destination, mode="selection", nonce=nonce, admit_before=A, hard_stop=H, packet_sha256=P, requirements_sha256=R, permit_sha256=N)`. Only selection manifests include `permit_sha256`, including failures/timeouts. Successful selection uses the same three filenames as discovery, but `complete.json` also records `split`, `inputs_sha256`, `permit_sha256`, `method_sha256`, and `result_sha256` (hashes of the two actual JSONL streams). Each selection trace row binds `packet_sha256`. Mixing files, receipts, or destinations between attempts is not supported. Discovery/probe manifests and the ACK protocol are unchanged.
+
+### Bounded order-ensemble control
+
+On discovery or selection, declare `order_ensemble: {"numerator": 1, "denominator": 4, "seed": 42}` in the settings. All three values are JSON integers, not booleans: `0 ≤ numerator ≤ denominator ≤ 10000`, denominator positive, `0 ≤ seed < 2³²`. Requires the **full model**, `reverse:false`, `loop:{"k":2,"method":"zero_extra"}` (optional `readout:"final"`); no compact, policy, or diagnostic mode.
+
+For `G` distinct groups, spend a second pass on exactly `floor(G × numerator / denominator)` groups, **not rows**. Each task gets its floor quota; remaining places go to largest remainders, ties by task string ascending. Within a task, rank groups by SHA-256 of the same canonical JSON encoding of `["joey-order-ensemble/v1", split, seed, task, group_id]`, ascending; tie by group ID. Groups spanning tasks are rejected. Row order, labels, logits, group size and latency do not choose the budget.
+
+Every row gets one genuine split forward (prelude, one block, coda). Only selected groups get a fresh forward on reversed criteria; average the two probability vectors **after** restoring original option order. No extra study-row warmup on selection or ensemble runs; fixed public parity cases remain separate setup work. Trace `ensemble_calls` and `forward_calls` are 1 or 2. `tokens`, `layer_calls` (24 or 48), and `callback_counts` sum the actual work across orders; wall and CUDA intervals enclose both calls. `complete.json.compute_spend` totals groups, extra groups, forward calls, coda calls and layer calls for measured study rows. These are compute counters, not evidence of improved accuracy or equal latency.
