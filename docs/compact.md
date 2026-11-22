@@ -71,6 +71,10 @@ The diagnostic checks the full source digest and compares only corresponding pos
 
 ## Evidence and limits
 
+`joey_research.pass_norms.source_readback(source, base, new_bundle, compact_manifest_sha256=trusted_base_pin, create=True)` is a separate CPU-only feasibility check. It copies the removed cycle's eight BF16 pre-attention and pre-MLP norm vectors for a possible **second visit only** to physical layers `[8,12)`. An independent second call with `create=False` reconstructs the expected file from the original source and checks every donor and retained vector against the verified earlier-cycle select-20 export. `read_vectors(bundle, manifest_sha256=trusted_bundle_pin, compact_manifest_sha256=trusted_base_pin)` checks the actual bundle without loading a model. Use only direct local inputs and an owner-only parent for the new bundle.
+
+The sidecar is **not a checkpoint** and is not consumed by any existing experiment worker. Count the entire base weight file plus the entire extra safetensors file, including its header. This preparation does not change the base, original masks, MLPs, or attention parameters; it does not establish parity, latency, memory savings, numerical benefit, or decision quality for a pass-specific runtime. A tensor-level difference is a feasibility signal, not evidence to promote a finalist.
+
 ```sh
 PYTHONPATH=src python -B -m unittest discover -s tests -p 'test_compact*.py' -v
 ```
