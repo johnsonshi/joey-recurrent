@@ -1,0 +1,17 @@
+{
+  "schema": "joey-norm-projection-geometry/v1",
+  "scope": "CPU-only weight geometry for the physical select-20 base and its pinned second-visit norm sidecar. No tokens, labels, activations, fitting, model invocation or GPU admission.",
+  "layer_pairs": [[8, 12], [9, 13], [10, 14], [11, 15]],
+  "width": 2048,
+  "stored_norm_offset": 1,
+  "decoder_member_sha256": "aac2a1bcca88829afc6dbdf83f97155ebf64d800ee9d703af3802a9aebcfcd18",
+  "projections": {
+    "linear_attention": ["linear_attn.in_proj_qkv.weight", "linear_attn.in_proj_z.weight", "linear_attn.in_proj_b.weight", "linear_attn.in_proj_a.weight"],
+    "full_attention": ["self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight"],
+    "mlp": ["mlp.gate_proj.weight", "mlp.up_proj.weight"]
+  },
+  "primary": "Sum squared coefficient differences for direct input projections. Identity: A diag(1+a) versus B diag(1+b). Donor: A diag(1+b) versus B diag(1+b). A and a are the actual retained matrix and norm; B and b are from its removed counterpart. Report one minus pooled donor SSE over identity SSE, not an average of layer percentages.",
+  "secondary": "Report per-layer and pre-attention/pre-MLP effects, moved-map norm relative to the anchor, and independent column-Gram reconstruction. Do not score output projections, attention kernels, nonlinearities or downstream layers.",
+  "limits": "The Frobenius metric weights normalized hidden coordinates equally. Real hidden inputs need not be isotropic. BF16 activation rounding and all downstream effects are absent. A better or worse weight match is not a decision score or an inference gate.",
+  "cpu": {"threads": 1, "row_tile": 128, "wall_seconds": 900}
+}

@@ -14,6 +14,7 @@ except ModuleNotFoundError as exc:
         raise
     raise unittest.SkipTest("weight geometry requires optional NumPy") from None
 from scripts import compact_spectrum as cs
+from scripts import norm_projection_geometry as ng
 
 
 def measure(a, b, ranks=(1,)):
@@ -125,6 +126,35 @@ class SpectrumTests(unittest.TestCase):
         hdr["text.15.mlp.down_proj.weight"].shape = (7, 5)
         with self.assertRaisesRegex(ValueError, "shape/dtype"):
             pairs(hdr)
+
+
+class NormProjectionTests(unittest.TestCase):
+    def test_scale_input_columns_not_rows_and_include_unit_offset(self):
+        a = np.array([[1, 2, -1], [0, 3, 4]], dtype=float)
+        b = np.array([[2, 0, -1], [1, 3, 2]], dtype=float)
+        first = np.array([-.25, .5, 0.]); second = np.array([.25, 0., -.5])
+        result = ng.measure(a.shape, lambda i,j: (a[i:j], b[i:j]), first, second, tile=1)
+        # Evaluate the three linear maps on all basis vectors, without broadcasting scales.
+        eye = np.eye(3)
+        anchor = [a @ ((1 + first) * e) for e in eye]
+        donor = [a @ ((1 + second) * e) for e in eye]
+        target = [b @ ((1 + second) * e) for e in eye]
+        for key, left, right in (("identity_sse", anchor, target), ("donor_sse", donor, target), ("shift_ss", donor, anchor)):
+            self.assertEqual(result[key], sum(float(np.dot(x-y,x-y)) for x,y in zip(left,right)))
+        self.assertEqual(result["entries"], 6)
+
+    def test_perfect_recovery_worsening_and_pooled_denominators(self):
+        m = np.ones((2, 3));ones = np.ones(3);zero = np.zeros(3)
+        perfect = ng.measure(m.shape, lambda i,j: (m[i:j],m[i:j]), zero, ones)
+        worse = ng.measure(m.shape, lambda i,j: (m[i:j],-.5*m[i:j]), zero, ones)
+        same = ng.measure(m.shape, lambda i,j: (m[i:j],m[i:j]), zero, zero)
+        self.assertEqual(perfect["fraction_gap_removed"], 1)
+        self.assertLess(worse["fraction_gap_removed"], 0)
+        self.assertIsNone(same["fraction_gap_removed"])
+        pooled = ng.summarize([perfect,worse,same])
+        self.assertEqual(pooled["fraction_gap_removed"], 1-54/30)
+        with self.assertRaises(ValueError):
+            ng.measure(m.shape, lambda i,j: (m[i:j],m[i:j]*np.nan), zero, ones)
 
 
 if __name__ == "__main__":
