@@ -53,5 +53,11 @@ class WorkloadTest(unittest.TestCase):
             with self.assertRaises(AdmissionError):self.compile(replace(self.ticket,**change))
         for ns in ("default","kube-system"):
             with self.assertRaises(AdmissionError):replace(self.target,namespace=ns)
+        shared=replace(self.target,namespace="default",shared_approval_sha256="5"*64)
+        with self.assertRaises(AdmissionError):self.compile(target=shared)
+        cm,job=self.compile(target=shared,namespace_approval_digest="5"*64)
+        for obj in (cm,job):
+            self.assertEqual(obj["metadata"]["namespace"],"default")
+            self.assertEqual(obj["metadata"]["labels"]["research.run/id"],shared.run_label)
         self.fields["deadline_utc"]=101
         with self.assertRaises(AdmissionError):self.compile()

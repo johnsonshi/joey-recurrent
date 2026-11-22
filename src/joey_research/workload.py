@@ -42,10 +42,12 @@ class BoundTarget:
     hosts: tuple[str, str]
     # Each item is the exact optional accelerator taint (key, value, effect) on that slot.
     taints: tuple[tuple[str, str, str] | None, tuple[str, str, str] | None]
+    shared_approval_sha256: str | None = None
 
     def __post_init__(self):
-        _require(_dns(self.namespace) and self.namespace != "default" and not self.namespace.startswith("kube-"),
-                 "dedicated project namespace required")
+        _require(_dns(self.namespace) and not self.namespace.startswith("kube-") and
+                 (_sha(self.shared_approval_sha256) if self.namespace=="default" else self.shared_approval_sha256 is None),
+                 "verified namespace selection required")
         _require(self.namespace_uid and _dns(self.run_label) and _dns(self.pool), "invalid local scope")
         _require(_dns(self.result_claim) and self.result_claim_uid, "preverified existing private output volume required")
         _require(isinstance(self.hosts, tuple) and len(self.hosts) == 2 and len(set(self.hosts)) == 2 and
@@ -66,11 +68,12 @@ class BoundTarget:
 
 def compile_discovery(target: BoundTarget, ticket: Admission, packet: bytes, *, now: int,
                       expected_run: str, namespace_uid: str, claim_uid: str, manifest_digest: str,
-                      packet_digest: str, split_digest: str) -> tuple[dict, dict]:
+                      packet_digest: str, split_digest: str, namespace_approval_digest: str | None = None) -> tuple[dict, dict]:
     """Build a single packet ConfigMap + Job. Verification of mirror, RBAC, custody and exclusivity precedes this."""
     _require(type(ticket) is Admission and type(now) is int and ticket.split is Split.DEV, "discovery admission required")
     _require(target.namespace_uid == namespace_uid and ticket.run_id == expected_run and _sha(expected_run),
              "project target or run changed")
+    _require(target.shared_approval_sha256 == namespace_approval_digest, "namespace approval differs from bound target")
     _require(claim_uid == target.result_claim_uid, "durable output identity changed")
     _require(_sha(manifest_digest) and ticket.manifest_sha == manifest_digest and _sha(ticket.trial_id) and _sha(ticket.token),
              "manifest or ticket hash mismatch")
