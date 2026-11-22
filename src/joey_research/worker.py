@@ -9,7 +9,9 @@ import os
 from pathlib import Path
 import re
 import signal
+import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict
 
 from .evaluation import input_sha256
@@ -96,6 +98,8 @@ def run(args) -> None:
         raise ValueError("invalid tier or duplicate decision IDs")
     for row in rows:
         choice_request(row, tuple(range(len(row["choices"]))))
+    if os.environ.get("TMPDIR") == "/work/tmp":
+        Path("/work/tmp").mkdir(mode=0o700, exist_ok=True)
     import torch
     from .native import NativeJoey
     if torch.cuda.device_count() != 1 or not torch.cuda.is_bf16_supported():
@@ -163,14 +167,38 @@ def run(args) -> None:
         os.fsync(f.fileno())
 
 
+@contextmanager
+def _quiet_native():
+    # Native libraries can print outside Python's sys.stderr. Jobs return results
+    # through their authorized private volume, not through shared container logs.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    backup = os.dup(1), os.dup(2)
+    try:
+        with open(os.devnull, "wb") as sink:
+            os.dup2(sink.fileno(), 1)
+            os.dup2(sink.fileno(), 2)
+            try:
+                yield
+            finally:
+                sys.stdout.flush()
+                sys.stderr.flush()
+    finally:
+        for destination, original in enumerate(backup, start=1):
+            os.dup2(original, destination)
+            os.close(original)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ("packet", "inputs", "model-dir", "output"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--compact-dir", type=Path)
     p.add_argument("--packet-sha256", required=True)
+    args = p.parse_args()
     try:
-        run(p.parse_args())
+        with _quiet_native():
+            run(args)
     except (OSError, ValueError, RuntimeError, KeyError, ImportError, TypeError) as e:
         # Never log the prompt, provider message, hostname, path or local bindings.
         p.exit(2, f"worker refused trial ({type(e).__name__}); incomplete output is not scoreable\n")
