@@ -12,3 +12,15 @@ Use the original decision interface, not a text-generation surrogate. Treat one-
 - Layer visits are not parameter counts, model bytes or measured latency.
 - Use frozen, staged inputs at runtime. Keep source weights, third-party data, credentials, raw predictions and deployment-specific files outside Git.
 - Do not interpret an example configuration as a model release, a measured result, or an official benchmark score.
+
+## Running the implementation
+
+The portable fixtures require Python 3.10+ and can run without model weights:
+
+```sh
+PYTHONPATH=src:. python3 -B -m unittest discover -s tests -q
+```
+
+For model execution, start with the [native runtime and stock parity checks](docs/native-runtime.md). The [Loop interface](docs/loop.md) changes the execution order without changing source tensors. The [Compact exporter](docs/compact.md) builds a smaller file, and the [Compact runtime](docs/native-compact.md) checks the reloaded model against an independent construction. The [discovery worker](docs/worker.md) measures one staged shard without receiving labels.
+
+The [evaluator](docs/evaluation.md) keeps gold labels separate and scores paired predictions at fixed menu order. The [two-slot scheduler](docs/scheduler.md) enforces leases, frozen selection and time cutoffs; it is not a cloud provisioner. The [study configuration](configs/study.json) defines the initial candidates and calibration thresholds before model results are known.
