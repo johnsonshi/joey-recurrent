@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from benchmarks import fixed_horizon, routing_edits as routing
+from benchmarks.routing_edits_metrics import compare_edits
 from joey_research.evaluation import EvaluationError, evaluate, input_sha256
 
 
@@ -247,6 +248,66 @@ class RoutingEditsTests(unittest.TestCase):
                      for r, m in self.samples]
         with self.assertRaises(EvaluationError):
             _audit(self.samples + duplicate)
+
+
+class EditScoreTests(unittest.TestCase):
+    def streams(self, samples, correct, *, reps=0):
+        rows, labels, arms, design, tokens = [], [], [[], []], {}, {}
+        for r, d in samples:
+            rows.append(r)
+            y, _ = routing.adjudicate(r)
+            labels.append(y)
+            for stream, right in zip(arms, correct(r, d), strict=True):
+                top = (y["gold_index"] + int(not right)) % 4
+                stream.append({"id": r["id"], "input_sha256": y["input_sha256"],
+                               "probs": [float(i == top) for i in range(4)]})
+            design[r["id"]] = d
+            tokens[r["id"]] = 42 + int(d["condition"] == "other_swap")
+        return dict(rows=rows, labels=labels, baseline=arms[0], candidate=arms[1], design_by_id=design,
+                    baseline_tokens=tokens, candidate_tokens=tokens.copy(), reps=reps)
+
+    def test_switch_and_preserve_are_not_three_correct_decisions(self):
+        data = self.streams(routing.iter_cases(_TOY_SEED, 2), lambda r, d: (False, True), reps=100)
+        z = compare_edits(**data)
+        a = z["all"]
+        self.assertEqual((z["rows"], a["triples"], z["cases"]), (96, 32, 16))
+        self.assertEqual((a["baseline"]["switch_on_target"], a["baseline"]["preserve_on_other"]), (32, 32))
+        self.assertEqual((a["baseline"]["all_three_correct"], a["candidate"]["all_three_correct"]), (0, 32))
+        self.assertEqual((a["triple_corrections"], a["triple_corruptions"], a["all_three_equal_tokens"]), (32, 0, 0))
+        self.assertEqual(a["paired"]["all_three"], {"delta": 1.0, "ci95": [1.0, 1.0]})
+        self.assertEqual(z["by_hop"]["6"]["paired"]["target_swap_brier"]["delta"], -2)
+
+    def test_draws_whole_graphs_and_uses_every_triple(self):
+        rows = list(routing.iter_cases(_TOY_SEED, 2))
+        first = rows[0][0]["group_id"]
+        d = self.streams(rows, lambda r, m: (r["group_id"] == first, r["group_id"] != first), reps=200)
+        a = compare_edits(**d)["all"]
+        self.assertEqual(a["paired"]["all_three"], {"delta": 0.0, "ci95": [-1.0, 1.0]})
+        self.assertEqual((a["triple_corrections"], a["triple_corruptions"]), (16, 16))
+        singleton = self.streams(rows[:48], lambda r, m: (True, True), reps=50)
+        self.assertIsNone(compare_edits(**singleton)["all"]["paired"]["all_three"]["ci95"])
+
+    def test_structurally_balanced_but_semantically_inverted_design_is_rejected(self):
+        samples = []
+        for r, m in routing.iter_cases(_TOY_SEED, 1):
+            if m["condition"] in _ROLES:
+                r, m = _rekey(r, {**m, "condition": _ROLES[1 - _ROLES.index(m["condition"])]})
+            samples.append((r, m))
+        self.assertEqual(_audit(samples)["rows"], 48)
+        with self.assertRaisesRegex(EvaluationError, "semantic adjudication"):
+            compare_edits(**self.streams(samples, lambda r, m: (True, True)))
+
+    def test_strict_binding_and_recorded_token_lengths(self):
+        for key in ("labels", "candidate", "baseline_tokens"):
+            d = self.streams(routing.iter_cases(_TOY_SEED, 1), lambda r, m: (True, True))
+            if key == "labels":
+                d[key][0]["gold_index"] = (d[key][0]["gold_index"] + 1) % 4
+            elif key == "candidate":
+                d[key].reverse()
+            else:
+                d[key][d["rows"][0]["id"]] += 1
+            with self.subTest(key=key), self.assertRaises(EvaluationError):
+                compare_edits(**d)
 
 
 if __name__ == "__main__":
