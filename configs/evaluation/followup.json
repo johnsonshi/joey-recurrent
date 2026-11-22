@@ -1,0 +1,39 @@
+{
+  "schema": "joey-post-screen-comparisons/v1",
+  "scope": "Predeclare downstream comparisons before opening selection labels",
+  "public_development": {
+    "dataset": "BANKING77 original training partition, 512 text-hash groups",
+    "projection": "research",
+    "official_test": false,
+    "menu": "complete original ordered list of 77 intents",
+    "fixed_methods": [
+      {"model":"full","window":[8,12],"loop":{"method":"naive","k":1}},
+      {"model":"full","window":[8,12],"loop":{"method":"zero_extra","k":2}},
+      {"model":"full","window":[8,12],"loop":{"method":"naive","k":2}},
+      {"model":"full","window":[8,12],"loop":{"method":"euler","k":3}},
+      {"model":"select-20","window":[8,12],"loop":{"method":"naive","k":1}},
+      {"model":"select-20","window":[8,12],"loop":{"method":"naive","k":2}}
+    ],
+    "metrics":["observed_class_macro_f1","choice_coverage","scored_gold_or_predicted_classes","accuracy","brier","nll","ece15"],
+    "use_for_final_nomination": false
+  },
+  "synthetic_confirmatory_nomination": {
+    "eligible": "original pre-nominated selection replications only",
+    "max_per_branch": 1,
+    "required_controls": ["same-payload one-pass", "full one-pass", "native split zero-extra", "visit-matched full stock order control for the additive finalist"],
+    "ranking": "Against its own one-pass anchor require positive macro accuracy delta, negative macro Brier delta and no increase in observed joint .90 confident errors. Rank qualified arms by descending paired macro accuracy lower bound, ascending paired macro Brier upper bound, then ascending measured mean per-decision CUDA time, then immutable method ID.",
+    "if_none_qualifies": "Carry the prespecified naive k=2 replication only, explicitly labeled as a negative-control replication rather than a qualified finalist.",
+    "no_diagnostic_promotions": true,
+    "compact_claim": "Both paired macro bounds must pass the predeclared noninferiority margins against full stock; no adjustment of the margins."
+  },
+  "posthoc_scalar_calibration": {
+    "fit_split":"calibration",
+    "allowed_parameter":"one scalar temperature per frozen arm, with the identical protocol for raw stock and every comparator",
+    "temperature_grid":[0.5,0.6666666666666666,0.8,1.0,1.25,1.5,2.0,3.0],
+    "objective":"equal-task-weight mean NLL",
+    "tie_break":["smallest absolute log temperature","lower temperature"],
+    "probabilities":"temperature-scale the full legal-slot distribution in log space; preserve true zeros; never renormalize an invalid input distribution",
+    "infinite_loss":"if every temperature has infinite objective, record no supported fit; retain the uncalibrated arm",
+    "final_reporting":"always report uncalibrated and separately labeled calibrated results on the same single frozen inference stream; never use a final label to select a temperature or method"
+  }
+}
