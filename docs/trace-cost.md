@@ -13,6 +13,8 @@ open a trace, run inference, or measure hardware.
 
 ## Inputs and grouping
 
+For memory, `allocator_observation(complete)` takes the corresponding **verified worker completion**, not an individual trace row. It returns raw bytes for the PyTorch allocator: `steady_allocated_bytes` and `steady_reserved_bytes` are instantaneous readings at the end of the timed loop, not time averages. `peak_allocated_bytes` and `peak_reserved_bytes` are maxima after the worker reset peak statistics following loading and parity checks. Resetting statistics does not clear the allocator's pool. Allocated and reserved peaks need not occur at the same moment. Device capacity is a bound, not measured consumption. These counters exclude memory outside this process's PyTorch allocator; none is an estimate of serialized weight bytes. Do not sum them over decisions or posthoc projections.
+
 Pass the physical **text** config of the measured method, not a multimodal wrapper or the
 original unpruned config for a compact model. Supply `num_hidden_layers`, ordered `layer_types`,
 and the dimensions below. The supported shape schema is `qwen3_5_text` with `attn_output_gate`

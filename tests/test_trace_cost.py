@@ -1,6 +1,6 @@
 import unittest
 
-from joey_research.trace_cost import account_trace
+from joey_research.trace_cost import account_trace, allocator_observation
 
 
 LINEAR, FULL = "linear_attention", "full_attention"
@@ -25,6 +25,20 @@ def account(trace, *, text=TEXT, window=WINDOW, method="invented", size=None):
 
 
 class TraceCostTests(unittest.TestCase):
+    def test_end_and_peak_allocator_counters_are_not_weight_or_timing_estimates(self):
+        complete = {"hardware": "A100", "batch_size": 1, "total_device_bytes": 1000,
+                    "steady_allocated_bytes": 200, "peak_allocated_bytes": 700,
+                    "steady_reserved_bytes": 450, "peak_reserved_bytes": 800,
+                    "weight_file_bytes": 2000, "cuda_event_ms": 11}
+        observed = allocator_observation(complete)
+        self.assertEqual((observed["steady_reserved_bytes"], observed["peak_allocated_bytes"]), (450, 700))
+        self.assertNotIn("weight_file_bytes", observed)
+        for change in ({"steady_allocated_bytes": None}, {"peak_reserved_bytes": True},
+                       {"peak_allocated_bytes": 199}, {"steady_reserved_bytes": 199},
+                       {"peak_reserved_bytes": 699}, {"total_device_bytes": 799}, {"batch_size": 2}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                allocator_observation({**complete, **change})
+
     def test_repeated_window_and_diagnostic_coda(self):
         result = account(row(5, 9, (0, 1, 2, 2), cuda_event_ms=0.625), size=2041)
         self.assertEqual((result["weight_file_bytes"], result["cuda_event_ms"]), (2041, 0.625))

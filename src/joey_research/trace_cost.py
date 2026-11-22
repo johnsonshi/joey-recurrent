@@ -20,6 +20,22 @@ def _integer(name: str, value: object, minimum: int = 0) -> int:
     return value
 
 
+def allocator_observation(completion: Mapping) -> dict[str, int]:
+    """Copy one batch-one A100 run's PyTorch byte counters, without inferring GPU use from storage."""
+    if not isinstance(completion, Mapping) or completion.get("hardware") != "A100":
+        raise ValueError("expected an A100 worker completion")
+    if _integer("batch_size", completion.get("batch_size"), 1) != 1:
+        raise ValueError("allocator reporting requires the measured batch-one protocol")
+    capacity = _integer("total_device_bytes", completion.get("total_device_bytes"), 1)
+    fields = ("steady_allocated_bytes", "peak_allocated_bytes", "steady_reserved_bytes", "peak_reserved_bytes")
+    observed = {name: _integer(name, completion.get(name)) for name in fields}
+    end, peak = observed["steady_allocated_bytes"], observed["peak_allocated_bytes"]
+    retained, pool_peak = observed["steady_reserved_bytes"], observed["peak_reserved_bytes"]
+    if not (end <= peak <= pool_peak <= capacity and end <= retained <= pool_peak):
+        raise ValueError("inconsistent end, peak, reservation or device capacity")
+    return {"total_device_bytes": capacity, **observed}
+
+
 class _Matmuls(NamedTuple):
     mlp: int           # per token-layer visit
     linear: int
