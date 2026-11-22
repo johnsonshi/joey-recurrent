@@ -23,7 +23,7 @@ import sys
 import time
 from types import MappingProxyType
 
-from .worker import PHASES, PROBE_MODE, SELECT20_LAYERS, TRANSFER_LOOPS, TRANSFER_MODE, PhaseGate
+from .worker import HORIZON_LOOPS, HORIZON_MODE, PHASES, PROBE_MODE, SELECT20_LAYERS, TRANSFER_LOOPS, TRANSFER_MODE, PhaseGate
 
 HOST, PORT = "127.0.0.1", 18765
 WORK, STAGED, ADMISSION = Path("/work"), Path("/staged"), Path("/admission")
@@ -348,9 +348,9 @@ def _completion_binding(metrics, attempt, jsonl_pins):
         _transfer_metrics(metrics)
     else:
         _require("probe_settings" not in metrics)
-    if attempt.mode in ("public-native", TRANSFER_MODE):
+    if attempt.mode in ("public-native", TRANSFER_MODE, HORIZON_MODE):
         _native_metrics(metrics)
-    if attempt.mode == TRANSFER_MODE:
+    if attempt.mode in (TRANSFER_MODE, HORIZON_MODE):
         _transfer_metrics(metrics)
 
 
@@ -422,17 +422,22 @@ def _transfer_metrics(metrics):
                  and all(_number(reload[k]) and reload[k] <= 1e-5 for k in ("max_abs_logit", "max_abs_probability")))
 
 
-def _transfer_calls(k, method):
-    _require((k, method) in TRANSFER_LOOPS)
+def _transfer_calls(k, method, *, vocabulary=TRANSFER_LOOPS):
+    _require(type(k) is int and (k, method) in vocabulary)
     return (1, 0, 0, 0) if k == 1 else (0, 1, 1 if method == "zero_extra" else k, 1)
 
 
-def _sealed_transfer_calls(metrics):
+def _sealed_transfer_calls(metrics, *, horizon=False):
     # Recovery has neither packet bytes nor staged inputs. Match the sealed *declared*
     # method ID within this finite vocabulary, including omitted LoopPlan defaults.
     base = {"window": [8, 12], "reverse": False}
     if "compact_manifest_sha256" in metrics:
         base.update(compact_recipe="select-20", compact_manifest_sha256=metrics["compact_manifest_sha256"])
+    if horizon:
+        for k, method in HORIZON_LOOPS:
+            if _sha(_encoded(dict(base, loop={"k": k, "method": method}))) == metrics["method_sha256"]:
+                return _transfer_calls(k, method, vocabulary=HORIZON_LOOPS)
+        raise TransportError("unknown sealed fixed-horizon method")
     for k, method in TRANSFER_LOOPS:
         for passes in (({}, {"k": k}) if k == 1 else ({"k": k},)):
             for rule in (({}, {"method": method}) if method == "naive" else ({"method": method},)):
@@ -442,11 +447,11 @@ def _sealed_transfer_calls(metrics):
     raise TransportError("unknown sealed transfer method")
 
 
-def _transfer_trace(trace, packet_pin, task, probs, depth, expected_calls):
+def _fixed_trace(trace, packet_pin, depth, expected_calls, *, typed):
     from .native import TRAINED_BRANCH_LIMIT
-    from .worker import validate_transfer_answer
-    _require(type(trace) is dict and set(trace) == {"id", "tokens", "layer_calls", "callback_counts", "readouts",
-                                                    "wall_ms", "cuda_event_ms", "packet_sha256", "transfer_answer"}
+    keys = {"id", "tokens", "layer_calls", "callback_counts", "readouts", "wall_ms", "cuda_event_ms", "packet_sha256"}
+    if typed: keys.add("transfer_answer")
+    _require(type(trace) is dict and set(trace) == keys
              and trace["packet_sha256"] == packet_pin and trace["readouts"] == []
              and _integer(trace["tokens"], 1, TRAINED_BRANCH_LIMIT)
              and all(_number(trace[k]) for k in ("wall_ms", "cuda_event_ms")))
@@ -457,6 +462,11 @@ def _transfer_trace(trace, packet_pin, task, probs, depth, expected_calls):
     _require(calls == expected_calls)
     layers = depth + 4 * (max(1, counts["block_calls"]) - 1)
     _require(_integer(trace["layer_calls"], layers, layers))
+
+
+def _transfer_trace(trace, packet_pin, task, probs, depth, expected_calls):
+    from .worker import validate_transfer_answer
+    _fixed_trace(trace, packet_pin, depth, expected_calls, typed=True)
     validate_transfer_answer(task, trace["transfer_answer"], probs)
 
 
@@ -464,12 +474,22 @@ def _transfer_streams(files, metrics, attempt, *, packet=None, rows=None):
     """Export against the admitted rows/arm; recheck the sealed pair offline without opening a shard."""
     pairs = zip(io.BytesIO(files["predictions.jsonl"]), io.BytesIO(files["trace.jsonl"]), strict=True)
     probe = attempt.mode==PROBE_MODE
+    horizon = attempt.mode == HORIZON_MODE
     if probe:
         from .probe_runtime import validate_trace
         settings=metrics["probe_settings"]
         if packet is not None:
             from .worker import _SETTINGS
             _require(_encoded({k:v for k,v in packet.items() if k in _SETTINGS})==_encoded(settings))
+    elif horizon:
+        expected = _sealed_transfer_calls(metrics, horizon=True)
+        if packet is not None:
+            from .worker import _SETTINGS, _horizon_arm, method_sha256
+            settings = {k: v for k, v in packet.items() if k in _SETTINGS}
+            small, k, name = _horizon_arm(settings)
+            _require(method_sha256(settings) == metrics["method_sha256"]
+                     and expected == _transfer_calls(k, name, vocabulary=HORIZON_LOOPS)
+                     and small == ("compact_manifest_sha256" in metrics))
     else:
         expected = (_sealed_transfer_calls(metrics) if packet is None else
                     _transfer_calls(packet["loop"].get("k", 1), packet["loop"].get("method", "naive")))
@@ -494,6 +514,10 @@ def _transfer_streams(files, metrics, attempt, *, packet=None, rows=None):
             task = {2: "stock-eligibility", 4: "stock-level", 5: "stock-choice"}.get(width)
         if probe:
             validate_trace(trace,pred["probs"],settings=settings,packet_sha256=attempt.packet_sha256)
+        elif horizon:
+            _require(width == 4 and all(_number(v) and v <= 1 for v in pred["probs"])
+                     and abs(math.fsum(pred["probs"]) - 1) <= 1e-6)
+            _fixed_trace(trace, attempt.packet_sha256, depth, expected, typed=False)
         else:
             _transfer_trace(trace, attempt.packet_sha256, task, pred["probs"], depth, expected)
         seen.add(pred["id"])
@@ -515,7 +539,7 @@ def _outputs(run, packet, rows, attempt):
         _require(all(metrics[k] == packet[k] for k in ("split", "permit_sha256", "method_sha256", "inputs_sha256")))
     _require(metrics["decisions"] == len(rows)
              and metrics.get("compact_manifest_sha256") == packet.get("compact_manifest_sha256"))
-    if attempt.mode in (PROBE_MODE,TRANSFER_MODE):
+    if attempt.mode in (PROBE_MODE,TRANSFER_MODE,HORIZON_MODE):
         _transfer_streams(files, metrics, attempt, packet=packet, rows=rows)
         return files
     _standard_metrics(metrics)
@@ -897,7 +921,7 @@ def _check_local(local, raw, doc, attempt, *, durable=False):
     for name, record in doc["files"].items():
         data = _read(local, name, record["bytes"], durable=durable)
         _require(len(data) == record["bytes"] and _sha(data) == record["sha256"])
-        if attempt.mode in (PROBE_MODE,TRANSFER_MODE):
+        if attempt.mode in (PROBE_MODE,TRANSFER_MODE,HORIZON_MODE):
             transfer[name] = data
         if name == "challenge.bin":
             _require(data == _challenge(attempt))
@@ -908,7 +932,7 @@ def _check_local(local, raw, doc, attempt, *, durable=False):
         elif name == "complete.json":
             _completion_binding(_json(data), attempt,
                                 {n: doc["files"][n]["sha256"] for n in ("predictions.jsonl", "trace.jsonl")})
-        elif name == "trace.jsonl" and attempt.mode not in (PROBE_MODE,TRANSFER_MODE):
+        elif name == "trace.jsonl" and attempt.mode not in (PROBE_MODE,TRANSFER_MODE,HORIZON_MODE):
             for line in io.BytesIO(data):
                 trace = _json(line)
                 if attempt.mode == "public-native":

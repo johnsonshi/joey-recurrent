@@ -21,16 +21,19 @@ from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
 TRANSFER_MODE = "typed-transfer"
 PROBE_MODE = "one-probe"
+HORIZON_MODE = "routing-horizon"
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
           "public-native": "banking77-original-train-native77/v1",
           TRANSFER_MODE: "joey-native-inventory-development/v1",
           PROBE_MODE: "joey-fresh-single-probe-routing/v1",
+          HORIZON_MODE: "joey-constant-evidence-routing/v1",
           "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
 NATIVE_OPTIONS = tuple(f"option_{i}" for i in range(77))
 SELECT20_LAYERS = (*range(12), *range(16, 24))
 TRANSFER_LOOPS = ((1, "naive"), (2, "naive"), (4, "naive"), (6, "naive"), (2, "zero_extra"))
+HORIZON_LOOPS = (*TRANSFER_LOOPS, (8, "naive"))
 _LEVELS = ("Empty (0 units)", "Low (1 to 3 units)", "Medium (4 to 6 units)", "High (7 or more units)")
 _TRANSFER_TASKS = {
     "stock-eligibility": ("noul", ("yes", "no"), "After posted entries only, does the focus depot have at least five units?"),
@@ -161,6 +164,18 @@ def _transfer_arm(window, plan, compact):
     return compact, plan.k, plan.method
 
 
+def _horizon_arm(settings):
+    compact = "compact_recipe" in settings
+    keys = {"window", "loop", "reverse"} | ({"compact_recipe", "compact_manifest_sha256"} if compact else set())
+    loop = settings["loop"]
+    if (set(settings) != keys or settings["window"] != [8, 12] or settings["reverse"] is not False
+            or type(loop) is not dict or set(loop) != {"k", "method"} or type(loop["k"]) is not int
+            or (loop["k"], loop["method"]) not in HORIZON_LOOPS
+            or (compact and settings["compact_recipe"] != "select-20")):
+        raise ValueError("outside the fixed-evidence routing comparison")
+    return compact, loop["k"], loop["method"]
+
+
 def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
                    policy=None, split="discovery", probe_margin=None) -> tuple[dict, dict]:
     if split not in ("discovery", "selection", *PHASES):
@@ -190,6 +205,11 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
         # Noul criteria keys and score descriptions are not the native slot labels.
         labels = _TRANSFER_TASKS[row["task"]][1]
     else:
+        if split == HORIZON_MODE and (reverse or policy is not None or plan.readout != "final"
+                or tuple(window) != (8, 12) or (plan.k, plan.method) not in HORIZON_LOOPS
+                or row["task"] != "fixed_evidence_route" or len(order) != 4
+                or hasattr(native, "physical_to_source") and tuple(native.physical_to_source) != SELECT20_LAYERS):
+            raise ValueError("nonfixed depth, payload or input in horizon comparison")
         state, questions = choice_request(row, order)
         qid = "decision"
         labels = tuple(questions[qid]["criteria"])
@@ -401,6 +421,13 @@ def _nominated(obj, methods, envelope):
             if arm in arms or len(compact_pins)>1:raise ValueError("duplicate probe arm or different compact payloads")
             arms.add(arm)
         elif "probe_margin" in settings:raise ValueError("first-margin method outside its independent phase")
+        if obj["split"] == HORIZON_MODE:
+            arm = _horizon_arm(settings)
+            if arm[0]:
+                compact_pins.add(settings["compact_manifest_sha256"])
+            if arm in arms or len(compact_pins) > 1:
+                raise ValueError("duplicate horizon arm or inconsistent physical payload")
+            arms.add(arm)
         if obj["split"] in ("public-native", TRANSFER_MODE):
             window, plan = _settings(settings)
             compact = "compact_manifest_sha256" in settings
@@ -545,6 +572,9 @@ def phase_rows(raw, view):
             input_sha256(row)
             if view["split"]==PROBE_MODE and (len(row["choices"])!=4 or row["task"] not in ("routing_2hop","routing_3hop","routing_4hop")):
                 raise ValueError("single-probe view needs four-way routed decisions")
+            if view["split"] == HORIZON_MODE and (row["task"] != "fixed_evidence_route" or len(row["choices"]) != 4
+                    or not all(re.fullmatch(r"Enter at [A-Z]{3}", c) for c in row["choices"])):
+                raise ValueError("fixed-horizon view requires its own four-entry menu")
         if len(rows) >= view["rows"] or row["id"] in seen or len(row["choices"]) > 255:
             raise ValueError("phase row inventory differs")
         if view["split"] in ("public-development", "public-native") and (
@@ -588,7 +618,7 @@ def run(args) -> None:
         if (selection or nomination_pin is not None or phase not in PHASES
                 or args.packet != transport.ADMISSION / "packet.json" or args.model_dir != transport.STAGED / "model"
                 or args.inputs != transport.STAGED / "inputs" / (phase + ".jsonl")
-                or (phase in (PROBE_MODE,TRANSFER_MODE) and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
+                or (phase in (PROBE_MODE,TRANSFER_MODE,HORIZON_MODE) and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
                 or args.compact_dir not in (None, transport.STAGED / "compact")):
             raise ValueError("wrong phase launch")
         gate = PhaseGate(phase, args.admit_before, args.hard_stop, args.packet_sha256, args.phase_permit_sha256,
@@ -606,7 +636,7 @@ def run(args) -> None:
     else:
         if nomination_pin is not None:
             raise ValueError("discovery cannot consume a nomination")
-        if getattr(args, "inputs", None) in (transport.STAGED / "inputs" / (n + ".jsonl") for n in (TRANSFER_MODE,PROBE_MODE)):
+        if getattr(args, "inputs", None) in (transport.STAGED / "inputs" / (n + ".jsonl") for n in (TRANSFER_MODE,PROBE_MODE,HORIZON_MODE)):
             raise ValueError("transfer or probe shard requires its phase gate")
         obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
     if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 30 * 3600:

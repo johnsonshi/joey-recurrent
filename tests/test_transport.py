@@ -80,7 +80,7 @@ class TransportTest(unittest.TestCase):
         a = self.discovery()
         if settings is None:
             settings = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
-            if mode=="one-probe":settings["loop"]["method"]="naive"
+            if mode in ("one-probe","routing-horizon"):settings["loop"]["method"]="naive"
         mid = worker.method_sha256(settings)
         public = mode in ("public-development", "public-native")
         if choices is None:
@@ -89,10 +89,13 @@ class TransportTest(unittest.TestCase):
                 choices = ["Yes", "No"]
             if mode == "one-probe":
                 choices = ["North","South","East","West"]
+            if mode == "routing-horizon":
+                choices = ["Enter at "+s for s in ("AAA","BBB","CCC","DDD")]
         row = dict(self.row, id="toy-" + mode, prompt="Invented café case?", choices=choices)
         if mode == "typed-transfer":
             row.update(task="stock-eligibility", prompt="Focus: Fern. Fern opens with 2 units; +4 posted, +1 pending.")
         if mode=="one-probe":row["task"]="routing_2hop"
+        if mode=="routing-horizon":row["task"]="fixed_evidence_route"
         records = [row] if rows is None else rows
         shard = b"".join(tr._encoded(r) + b"\n" for r in records)
         if mode == "public-native":
@@ -449,6 +452,28 @@ class TransportTest(unittest.TestCase):
         self.assertNotIn("/ack", [c.args[2] for c in get.call_args_list])
         self.assertFalse((self.root / "mixed").exists())
 
+    def test_horizon_catalog_fences_deep_fixed_repeats_and_original_input_role(self):
+        mode="routing-horizon"
+        base={"window":[8,12],"loop":{"k":8,"method":"naive"},"reverse":False}
+        for small in (False,True):
+            m={**base,**({"compact_recipe":"select-20","compact_manifest_sha256":"a"*64} if small else {})}
+            a=self.phase_attempt(mode,settings=m);packet,_,plan,rows=tr._phase_inputs(a.phase_gate())
+            self.assertEqual((plan.k,rows[0]["task"]),(8,"fixed_evidence_route"))
+            metrics={"method_sha256":packet["method_sha256"],**({"compact_manifest_sha256":"a"*64} if small else {})}
+            calls=tr._sealed_transfer_calls(metrics,horizon=True);self.assertEqual(calls,(0,1,8,1))
+            trace={"id":rows[0]["id"],"tokens":33,"readouts":[],"layer_calls":48 if small else 52,
+                   "packet_sha256":a.packet_sha256,"wall_ms":1,"cuda_event_ms":1,
+                   "callback_counts":dict(zip(("stock_calls","prelude_calls","block_calls","coda_calls"),calls))}
+            tr._fixed_trace(trace,a.packet_sha256,20 if small else 24,calls,typed=False)
+            with self.assertRaises(ValueError):tr._fixed_trace(dict(trace,transfer_answer={}),a.packet_sha256,20 if small else 24,calls,typed=False)
+            with self.assertRaises(ValueError):tr._sealed_transfer_calls(metrics)
+        for changed in (dict(base,reverse=True),dict(base,loop={"method":"naive","k":3}),
+                        dict(base,loop={"method":"naive","k":8,"readout":"diagnostic"}),dict(base,window=[4,8])):
+            with self.subTest(changed=changed),self.assertRaises(ValueError):
+                tr._phase_inputs(self.phase_attempt(mode,settings=changed).phase_gate())
+        with self.assertRaises(ValueError):
+            tr._phase_inputs(self.phase_attempt(mode,choices=["Yes","No","East","West"]).phase_gate())
+
     def test_phase_permits_are_role_view_release_and_time_specific(self):
         for mode in worker.PHASES:
             with self.subTest(mode=mode):
@@ -799,7 +824,7 @@ class TransportTest(unittest.TestCase):
                     a = self.phase_attempt(mode)
                     status, files = tr._result(a)
                     self.assertEqual(status, "complete")
-                    self.assertEqual(observations.pop(), 77 if mode in ("public-development", "public-native") else 4 if mode=="one-probe" else 2)
+                    self.assertEqual(observations.pop(), 77 if mode in ("public-development", "public-native") else 4 if mode in ("one-probe","routing-horizon") else 2)
                     self.assertFalse(observations)  # No extra real-row warmup.
                     if mode == "public-native":
                         trace = json.loads(files["trace.jsonl"])
