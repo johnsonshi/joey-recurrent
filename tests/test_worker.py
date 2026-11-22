@@ -5,11 +5,22 @@ from types import SimpleNamespace
 
 from joey_research.loop import LoopPlan
 from joey_research.loop_analysis import Policy, Stop
-from joey_research.worker import _packet, choice_request, measure_choice
+from joey_research.worker import _packet, choice_request, compact_recipe, measure_choice
 
 
 class WorkerTest(unittest.TestCase):
     row = {"id":"one", "group_id":"graph", "task":"choice", "prompt":"Which fits?", "choices":["Red","Green","Blue"]}
+
+    def test_constructed_compact_plan_matches_its_independent_export_recipe(self):
+        from pathlib import Path
+        root=Path(__file__).resolve().parents[1]
+        for name in ("select-20","select-16","merge-16"):
+            self.assertEqual(compact_recipe(name),json.loads((root/"configs/compact"/(name+".json")).read_bytes()))
+        packet={"schema":1,"split":"discovery","inputs_sha256":"0"*64,"loop":{"k":1},"window":[8,12],
+                "reverse":False,"deadline_utc":100,"compact_recipe":"select-20"}
+        with self.assertRaisesRegex(ValueError,"independent"):_packet(json.dumps(packet).encode())
+        packet["compact_manifest_sha256"]="1"*64
+        self.assertEqual(_packet(json.dumps(packet).encode())[0]["compact_recipe"],"select-20")
 
     def test_reverse_is_mapped_back_and_does_not_send_bookkeeping(self):
         class Native:

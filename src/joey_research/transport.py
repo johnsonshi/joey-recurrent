@@ -422,7 +422,7 @@ def _result(attempt):
             argv = [sys.executable, "-sPB", "-m", "joey_research.worker", "--packet", str(ADMISSION / "packet.json"),
                     "--packet-sha256", attempt.packet_sha256, "--model-dir", str(STAGED / "model"),
                     "--inputs", str(STAGED / "inputs/discovery.jsonl"), "--output", str(WORK / "run/out")]
-            if "compact_manifest_sha256" in packet:
+            if "compact_manifest_sha256" in packet and "compact_recipe" not in packet:
                 argv += ["--compact-dir", str(STAGED / "compact")]
             _phase(attempt, argv, cwd="/", installed=True)
             return "complete", _outputs(run, packet, rows, attempt)

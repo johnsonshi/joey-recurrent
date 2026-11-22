@@ -19,6 +19,20 @@ from .loop import LoopPlan, run_loop
 from .loop_analysis import Policy, SlotOrder, Stop, actuate
 
 
+def compact_recipe(name: str) -> dict:
+    if name == "select-20":
+        groups, repeat = [{"cycles":[g]} for g in (0,1,2,4,5)], [2,3]
+    elif name == "select-16":
+        groups, repeat = [{"cycles":[g]} for g in (0,2,3,5)], [1,3]
+    elif name == "merge-16":
+        groups = [{"cycles":[0]}, {"cycles":[1,2],"weights":[0.25,0.75],"anchor":2},
+                  {"cycles":[3,4],"weights":[0.75,0.25]}, {"cycles":[5]}]
+        repeat = [1,3]
+    else:
+        raise ValueError("unknown deterministic compact topology")
+    return {"format":"joey-compact/v1","groups":groups,"repeat_cycles":repeat}
+
+
 def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
     input_sha256(row)  # Validate the label-free projection.
     choices = row["choices"]
@@ -88,10 +102,14 @@ def _policy(obj):
 def _packet(raw: bytes) -> tuple[dict, tuple[int, int], LoopPlan]:
     obj = json.loads(raw)
     required = {"schema", "split", "inputs_sha256", "window", "loop", "reverse", "deadline_utc"}
-    if not required <= set(obj) <= (required | {"compact_manifest_sha256","policy"}) or obj["schema"] != 1:
+    if not required <= set(obj) <= (required | {"compact_manifest_sha256","compact_recipe","policy"}) or obj["schema"] != 1:
         raise ValueError("unexpected worker packet")
     if "compact_manifest_sha256" in obj and not re.fullmatch(r"[0-9a-f]{64}", obj["compact_manifest_sha256"]):
         raise ValueError("invalid compact receipt")
+    if "compact_recipe" in obj:
+        compact_recipe(obj["compact_recipe"])
+        if "compact_manifest_sha256" not in obj:
+            raise ValueError("derived compact payload needs an independent coordinator pin")
     if obj["split"] != "discovery" or type(obj["reverse"]) is not bool:
         raise ValueError("worker only accepts explicit discovery packets")
     w = obj["window"]
@@ -140,10 +158,19 @@ def run(args) -> None:
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     begin = time.perf_counter()
     if "compact_manifest_sha256" in obj:
-        if args.compact_dir is None:
+        if "compact_recipe" in obj:
+            from .compact import export_compact
+            if args.compact_dir is not None:
+                raise ValueError("choose a staged or a derived compact directory, not both")
+            compact_dir = args.output.parent / "derived-compact"
+            export_compact(args.model_dir, compact_dir, compact_recipe(obj["compact_recipe"]))
+            _load(compact_dir / "compact.json", obj["compact_manifest_sha256"])
+        elif args.compact_dir is None:
             raise ValueError("verified compact directory required")
+        else:
+            compact_dir = args.compact_dir
         from .native_compact import CompactJoey
-        native = CompactJoey.load(args.compact_dir, source_model_dir=args.model_dir,
+        native = CompactJoey.load(compact_dir, source_model_dir=args.model_dir,
                                   expected_manifest_sha256=obj["compact_manifest_sha256"])
         if native.repeat_window != window:
             raise ValueError("compact window differs from the verified physical mapping")
