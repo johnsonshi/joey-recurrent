@@ -62,3 +62,60 @@ On discovery or selection, declare `order_ensemble: {"numerator": 1, "denominato
 For `G` distinct groups, spend a second pass on exactly `floor(G × numerator / denominator)` groups, **not rows**. Each task gets its floor quota; remaining places go to largest remainders, ties by task string ascending. Within a task, rank groups by SHA-256 of the same canonical JSON encoding of `["joey-order-ensemble/v1", split, seed, task, group_id]`, ascending; tie by group ID. Groups spanning tasks are rejected. Row order, labels, logits, group size and latency do not choose the budget.
 
 Every row gets one genuine split forward (prelude, one block, coda). Only selected groups get a fresh forward on reversed criteria; average the two probability vectors **after** restoring original option order. No extra study-row warmup on selection or ensemble runs; fixed public parity cases remain separate setup work. Trace `ensemble_calls` and `forward_calls` are 1 or 2. `tokens`, `layer_calls` (24 or 48), and `callback_counts` sum the actual work across orders; wall and CUDA intervals enclose both calls. `complete.json.compute_spend` totals groups, extra groups, forward calls, coda calls and layer calls for measured study rows. These are compute counters, not evidence of improved accuracy or equal latency.
+
+## Frozen phase transition — isolated implementation, not a release
+
+These modes are **siblings** of selection. No real phase, including final, is authorized by this code or its fixtures. The coordinator must verify run identity, provenance of the label-free shard, and immutable role-specific approval (finalists/protocol freeze for final) under the timed queue **before** releasing the permit and starting an attempt. Digest agreement alone does not establish that authority. Do not stage any labels. Calibration here means collecting predictions on a frozen view, **not** fitting or loading a calibration model.
+
+| `MODE` | Required `view.projection` | Release flag (other flag forbidden) |
+|---|---|---|
+| `public-development` | `banking77-public-train-research-77/v1` | `--approval-sha256 J` (public train research approval) |
+| `calibration` | `joey-calibration-research/v1` | `--approval-sha256 J` (calibration approval) |
+| `final` | `joey-final-research/v1` | `--final-freeze-sha256 J` (final freeze) |
+
+```
+python -m joey_research.transport MODE --admit-before A --hard-stop H \
+  --packet-sha256 P --requirements-sha256 R --phase-permit-sha256 N \
+  --run-sha256 U --view-sha256 V <role-specific release flag above>
+```
+
+Same fresh `JOEY_EXPORT_NONCE`, exact-Pod forward, quiet supervised child, verified runtime lock and private scratch as before. Data reads are fixed at `/admission/packet.json`, `/admission/MODE-permit.json` and `/staged/inputs/MODE.jsonl` on immutable read-only mounts. No alternate path or discovery/selection fallback. The supervised worker receives `--phase MODE --phase-permit-sha256 N --run-sha256 U --view-sha256 V --admit-before A --hard-stop H` and the same release flag, in addition to its usual fixed packet/model/input/output arguments. `--selection`/`--nomination-sha256` cannot admit a phase. Both processes independently re-open and verify the permit, packet and shard before native import.
+
+Exact schemas, using the selection section's canonical settings encoding:
+
+```python
+view = {"schema": "joey-label-free-view/v1", "split": MODE, "projection": PROJECTION,
+        "inputs_sha256": S, "split_manifest_sha256": F, "rows": ROWS, "bytes": SIZE}
+# Public-development ONLY: also set view["menu_sha256"] to SHA256(canonical JSON bytes
+# of the approved ordered list of all 77 choice strings). Every row must match it.
+V = worker.view_sha256(view)
+M = worker.method_sha256(settings)
+release_key = "final_freeze_sha256" if MODE == "final" else "approval_sha256"
+permit = {"schema": f"joey-{MODE}-permit/v1", "split": MODE, "not_before": T,
+          "admit_before": A, "hard_stop": H, "run_sha256": U, release_key: J,
+          "view": view, "methods": {M: settings}}
+# N = SHA256(exact permit bytes). S = SHA256(exact shard bytes, including newlines).
+packet = {"schema": 1, "split": MODE, "deadline_utc": H, "inputs_sha256": S,
+          "view_sha256": V, "permit_sha256": N, "method_sha256": M, **settings}
+# P = SHA256(exact packet bytes); retain P, R, N, U, V, J independently of these mounts.
+```
+
+`T, A, H` are integer UTC seconds; `0 < T < A ≤ H`, `H − T ≤ 3600`. A phase may start only in `[T, min(A,H−15))`. All methods obey the existing settings allowlist and exact method digests. Views have exactly the shown keys (plus `menu_sha256` only for public-development), 1–20000 distinct decision IDs, and a nonempty shard no larger than 64 MiB. Public-development is the full-menu **research projection**, not a native index score or an official test split. Row validation rejects extra fields instead of removing them.
+
+The manifest and `complete.json` bind `MODE` (manifest `mode`, metrics `split`), `permit_sha256`, `run_sha256`, `view_sha256`, and **only** the corresponding release digest. A phase completion seals the two actual JSONL digests, method, input digest and packet as for selection. Failures/timeouts have no result files. No default-discovery, probe or selection manifest acquires these new fields.
+
+### Verified phase collection and ACK-loss recovery
+
+Use the fresh nonce and all launch pins **from the coordinator's own journal**, not from the saved manifest. In addition to the normal private, single-writer destination, retain the exact Pod UID and terminal-state evidence separately:
+
+```python
+args = dict(mode=MODE, nonce=NONCE, admit_before=A, hard_stop=H,
+            packet_sha256=P, requirements_sha256=R, permit_sha256=N,
+            run_sha256=U, view_sha256=V, **{release_key: J})
+attempt = transport.Attempt(**args)
+D = transport.pin_receipt(port, attempt)  # authenticated GET through the authorized forward
+# Durably journal D independently BEFORE collection, even for a failed or timeout receipt.
+manifest = transport.collect(port, new_destination, receipt_sha256=D, **args)
+```
+
+If collection published the directory but ACK was lost, `transport.recover(destination, attempt=attempt, receipt_sha256=D)` verifies the original local receipt, complete file inventory, byte lengths, SHA-256, and sealed worker result bindings, and fsyncs files and directories again. It may run offline after expiry; it proves local custody, **not** delivery of an ACK or successful inference. With an independently re-established forward to the **same UID before H**, pass `port=port` to also require byte-identical live manifest evidence before re-ACK. Never infer `D` from the suspect directory. Missing/partial custody, mismatched pins/nonce, or changed files fail closed; recovery never creates a release, reruns inference, or overwrites results.

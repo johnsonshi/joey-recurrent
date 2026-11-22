@@ -76,6 +76,31 @@ class TransportTest(unittest.TestCase):
         (tr.ADMISSION / "packet.json").write_bytes(packet)
         return replace(a, mode="selection", permit_sha256=tr._sha(nom), packet_sha256=tr._sha(packet)), rows
 
+    def phase_attempt(self, mode, *, choices=None, view_changes=None, permit_changes=None, packet_changes=None):
+        a = self.discovery()
+        settings = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
+        mid = worker.method_sha256(settings)
+        choices = choices or ([f"synthetic option {i}" for i in range(77)] if mode == "public-development" else ["A", "B"])
+        shard = tr._encoded(dict(self.row, id="toy-" + mode, choices=choices)) + b"\n"
+        (tr.STAGED / "inputs" / (mode + ".jsonl")).write_bytes(shard)
+        view = {"schema": "joey-label-free-view/v1", "split": mode, "projection": worker.PHASES[mode],
+                "inputs_sha256": tr._sha(shard), "split_manifest_sha256": "e"*64, "rows": 1, "bytes": len(shard)}
+        if mode == "public-development":
+            view["menu_sha256"] = tr._sha(tr._encoded(choices))
+        view.update(view_changes or {})
+        vp = worker.view_sha256(view)
+        release = ({"final_freeze_sha256": "d"*64} if mode == "final" else {"approval_sha256": "c"*64})
+        permit = {"schema": f"joey-{mode}-permit/v1", "split": mode, "not_before": a.hard_stop-100, "admit_before": a.admit_before,
+                  "hard_stop": a.hard_stop, "run_sha256": "b"*64, **release, "view": view, "methods": {mid: settings}}
+        permit_bytes = tr._encoded(dict(permit, **(permit_changes or {})))
+        (tr.ADMISSION / (mode + "-permit.json")).write_bytes(permit_bytes)
+        arguments = {"schema": 1, "split": mode, "deadline_utc": a.hard_stop, "inputs_sha256": view["inputs_sha256"],
+                     "permit_sha256": tr._sha(permit_bytes), "method_sha256": mid, "view_sha256": vp, **settings}
+        packet = tr._encoded(dict(arguments, **(packet_changes or {})))
+        (tr.ADMISSION / "packet.json").write_bytes(packet)
+        return replace(a, mode=mode, packet_sha256=tr._sha(packet), permit_sha256=tr._sha(permit_bytes),
+                       view_sha256=vp, run_sha256="b"*64, **release)
+
     @staticmethod
     def probe_doc():
         # Deliberately include identifying attributes in the fake CUDA object;
@@ -402,6 +427,145 @@ class TransportTest(unittest.TestCase):
                            packet_sha256=a.packet_sha256, requirements_sha256=a.requirements_sha256, permit_sha256=a.permit_sha256)
         self.assertNotIn("/ack", [c.args[2] for c in get.call_args_list])
         self.assertFalse((self.root / "mixed").exists())
+
+    def test_phase_permits_are_role_view_release_and_time_specific(self):
+        for mode in worker.PHASES:
+            with self.subTest(mode=mode):
+                a = self.phase_attempt(mode)
+                self.assertEqual(tr._phase_inputs(a.phase_gate())[0]["split"], mode)
+                wrong = dict(final_freeze_sha256=None) if mode == "final" else dict(approval_sha256=None)
+                with self.assertRaises(ValueError):
+                    replace(a, **wrong)
+                for change in ({"run_sha256": "a"*64}, {"view_sha256": "a"*64}, {"permit_sha256": "a"*64},
+                               {"hard_stop": a.hard_stop+1}, {"admit_before": a.admit_before-1}):
+                    with self.assertRaises(ValueError):
+                        tr._phase_inputs(replace(a, **change).phase_gate())
+                with patch.object(time, "time", return_value=a.admit_before), self.assertRaises(TimeoutError):
+                    tr._phase_inputs(a.phase_gate())
+                with patch.object(time, "time", return_value=a.hard_stop-101), self.assertRaises(TimeoutError):
+                    tr._phase_inputs(a.phase_gate())
+                with self.assertRaises(ValueError):
+                    worker._packet(tr._packet_bytes())
+                with self.assertRaises(ValueError):
+                    worker.selection_packet(tr._packet_bytes(), tr._admission_bytes(mode+"-permit.json"),
+                                            packet_sha256=a.packet_sha256, nomination_sha256=a.permit_sha256)
+                other = "final" if mode != "final" else "calibration"
+                for changes in ({"packet_changes": {"split": "selection"}}, {"packet_changes": {"reverse": True}},
+                                {"view_changes": {"projection": worker.PHASES[other]}},
+                                {"view_changes": {"split": other}}, {"view_changes": {"rows": 2}},
+                                {"permit_changes": {"schema": f"joey-{other}-permit/v1"}},
+                                {"permit_changes": {"methods": {}}}):
+                    with self.assertRaises(ValueError):
+                        tr._phase_inputs(self.phase_attempt(mode, **changes).phase_gate())
+        for args in ({"choices": ["A", "B"]}, {"view_changes": {"menu_sha256": "1"*64}}):
+            with self.assertRaises(ValueError):
+                tr._phase_inputs(self.phase_attempt("public-development", **args).phase_gate())
+
+    def test_phase_worker_independently_refuses_replaced_shard(self):
+        a = self.phase_attempt("calibration")
+        tr._phase_inputs(a.phase_gate())
+        shard = tr.STAGED / "inputs/calibration.jsonl"
+        shard.write_bytes((tr.STAGED / "inputs/discovery.jsonl").read_bytes())
+        args = SimpleNamespace(phase=a.mode, selection=False, nomination_sha256=None, packet=tr.ADMISSION / "packet.json",
+                               inputs=shard, model_dir=tr.STAGED / "model", compact_dir=None, packet_sha256=a.packet_sha256,
+                               phase_permit_sha256=a.permit_sha256, admit_before=a.admit_before, hard_stop=a.hard_stop,
+                               run_sha256=a.run_sha256, view_sha256=a.view_sha256, approval_sha256=a.approval_sha256,
+                               final_freeze_sha256=None)
+        with patch.dict(os.environ, {k: "1" for k in ("TRANSFORMERS_OFFLINE", "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE")}), \
+                patch.dict(sys.modules, torch=None):
+            with self.assertRaisesRegex(ValueError, "shard"):
+                worker.run(args)
+            args.inputs = tr.STAGED / "inputs/discovery.jsonl"
+            with self.assertRaisesRegex(ValueError, "launch"):
+                worker.run(args)
+
+    def test_cpu_phase_export_and_verified_recovery_after_lost_ack(self):
+        # All three synthetic admissions drive the same existing inference path.
+        # Neither a real model nor an actual release receipt is present.
+        @dataclass
+        class Parity:
+            fixture: bool = True
+
+        observations = []
+        def branches(state, qs, *, window):
+            labels = tuple(qs["decision"]["criteria"])
+            observations.append(len(labels))
+            return {"decision": SimpleNamespace(labels=labels, layout=SimpleNamespace(input_ids=(1,)),
+                    inference_context=contextlib.nullcontext, stock=lambda: 0,
+                    probabilities=lambda _: [1/len(labels)]*len(labels))}
+        native = SimpleNamespace(branches=branches, verify_parity=lambda **kw: Parity())
+        cuda = SimpleNamespace(device_count=lambda: 1, is_bf16_supported=lambda: True, get_device_properties=lambda _: (
+            SimpleNamespace(name="fixture A100", major=8, minor=0, total_memory=42)), synchronize=lambda: None,
+            reset_peak_memory_stats=lambda: None, Event=lambda **kw: SimpleNamespace(record=lambda: None, elapsed_time=lambda _: 1),
+            **{k: lambda: 1 for k in ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved")})
+        def phase(a, argv, *, cwd, installed):
+            if installed:
+                worker.main(argv[argv.index("joey_research.worker")+1:])
+            else:
+                self.assertIn("pip", argv)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, torch=SimpleNamespace(cuda=cuda)))
+            stack.enter_context(patch("joey_research.native.NativeJoey.load", return_value=native))
+            stack.enter_context(patch.dict(os.environ, {k: "1" for k in (
+                "HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")}, clear=True))
+            for module, name in ((signal, "signal"), (signal, "setitimer"), (os, "umask")):
+                stack.enter_context(patch.object(module, name))
+            stack.enter_context(patch.object(tr, "_phase", side_effect=phase))
+            for mode in worker.PHASES:
+                with self.subTest(mode=mode):
+                    a = self.phase_attempt(mode)
+                    status, files = tr._result(a)
+                    self.assertEqual(status, "complete")
+                    self.assertEqual(observations.pop(), 77 if mode == "public-development" else 2)
+                    self.assertFalse(observations)  # No extra real-row warmup.
+                    routes = tr._publication(a, status, files)
+                    args = dict(mode=a.mode, nonce=a.nonce, admit_before=a.admit_before, hard_stop=a.hard_stop,
+                                packet_sha256=a.packet_sha256, requirements_sha256=a.requirements_sha256,
+                                permit_sha256=a.permit_sha256, **a.phase_gate().evidence())
+                    saved = self.root / ("durable-" + mode)
+                    exits = []
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                        listener.bind(("127.0.0.1", 0))
+                        listener.listen()
+                        port = listener.getsockname()[1]
+                        server = threading.Thread(target=lambda: exits.append(tr._serve(listener, a, routes, status)),
+                                                  daemon=True)
+                        server.start()
+                        journaled_digest = tr.pin_receipt(port, a)
+                        exchange = tr._exchange
+                        def lose_ack(p, att, target, lim, **kw):
+                            if target == "/ack":
+                                raise ConnectionError("fixture")
+                            return exchange(p, att, target, lim, **kw)
+                        with patch.object(tr, "_exchange", side_effect=lose_ack), self.assertRaises(tr.TransportError):
+                            tr.collect(port, saved, **args, receipt_sha256=journaled_digest)
+                        with self.assertRaises(tr.TransportError):
+                            tr.recover(saved, attempt=a, receipt_sha256="0"*64)
+                        for wrong in (replace(a, nonce="0"*64), replace(a, run_sha256="0"*64),
+                                      replace(a, view_sha256="0"*64), replace(a, permit_sha256="0"*64)):
+                            with self.assertRaises(tr.TransportError):
+                                tr.recover(saved, attempt=wrong, receipt_sha256=journaled_digest)
+                        pred = saved / "predictions.jsonl"
+                        original = pred.read_bytes()
+                        pred.write_bytes(original + b"\n")
+                        with self.assertRaises(tr.TransportError):
+                            tr.recover(saved, attempt=a, receipt_sha256=journaled_digest, port=port)
+                        pred.write_bytes(original)
+                        # The cross-mode source result must not be accepted under a different authorized attempt.
+                        other = self.phase_attempt("calibration" if mode != "calibration" else "public-development")
+                        with self.assertRaises(ValueError):
+                            tr._completion_binding(json.loads(files["complete.json"]), other,
+                                {n: tr._sha(files[n]) for n in ("predictions.jsonl", "trace.jsonl")})
+                        doc = tr.recover(saved, attempt=a, receipt_sha256=journaled_digest, port=port)
+                        self.assertEqual(doc["mode"], mode)
+                        server.join(2)
+                    self.assertEqual(exits, [0])
+                    with patch.object(time, "time", return_value=a.hard_stop+1):
+                        self.assertEqual(tr.recover(saved, attempt=a, receipt_sha256=journaled_digest), doc)
+                        with self.assertRaises(tr.TransportError):
+                            tr.recover(saved, attempt=a, receipt_sha256=journaled_digest, port=port)
+                    for dirname in ("site", "run", "tmp"):
+                        shutil.rmtree(tr.WORK / dirname)
 
     def test_refuses_unbound_input_labels_and_expiry_before_child(self):
         for bad in ("label", "split", "deadline", "input_pin", "packet_pin"):

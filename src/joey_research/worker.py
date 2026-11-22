@@ -12,11 +12,15 @@ import signal
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from io import BytesIO
 
 from .evaluation import input_sha256
 from .loop import LoopPlan, run_loop
 from .loop_analysis import Policy, SlotOrder, Stop, actuate
+
+PHASES = {"public-development": "banking77-public-train-research-77/v1",
+          "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 
 
 def compact_recipe(name: str) -> dict:
@@ -44,7 +48,7 @@ def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
 
 def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
                    policy=None, split="discovery") -> tuple[dict, dict]:
-    if split not in ("discovery", "selection"):
+    if split not in ("discovery", "selection", *PHASES):
         raise ValueError("unsupported inference split")
     order = tuple(range(len(row["choices"])))
     if reverse:
@@ -129,7 +133,7 @@ def _fraction(cfg):
 def ensemble_groups(task_groups, config, *, split):
     """Choose whole groups from (task, group_id) pairs, independent of rows, labels and scores."""
     numerator, denominator, seed = _fraction(config)
-    if split not in ("discovery", "selection"):
+    if split not in ("discovery", "selection", *PHASES):
         raise ValueError("unsupported spend split")
     owners, tasks = {}, {}
     for task, group in task_groups:
@@ -213,16 +217,122 @@ def selection_packet(raw: bytes, nomination: bytes, *, packet_sha256: str, nomin
             or permit["inputs_sha256"] != obj["inputs_sha256"] or obj["permit_sha256"] != nomination_sha256
             or not _pin(obj["method_sha256"]) or obj["method_sha256"] not in permit["methods"]):
         raise ValueError("selection packet does not match its permit")
-    for key, settings in permit["methods"].items():
+    return _nominated(obj, permit["methods"], _SELECTION_ENVELOPE)
+
+
+def _nominated(obj, methods, envelope):
+    if type(methods) is not dict or not 1 <= len(methods) <= 256 or obj["method_sha256"] not in methods:
+        raise ValueError("no authorized method")
+    for key, settings in methods.items():
         if key != method_sha256(settings):
             raise ValueError("invalid nominated method ID")
-    declared = {k: v for k, v in obj.items() if k not in _SELECTION_ENVELOPE}
+    declared = {k: v for k, v in obj.items() if k not in envelope}
     window, plan = _settings(declared)
     # Comparing canonical bytes also distinguishes true/1, 1/1.0, and a
     # missing field vs an explicitly supplied default.
-    if _canonical(declared) != _canonical(permit["methods"][obj["method_sha256"]]):
+    if _canonical(declared) != _canonical(methods[obj["method_sha256"]]):
         raise ValueError("selection settings differ from the nominated method")
     return obj, window, plan
+
+
+@dataclass(frozen=True)
+class PhaseGate:
+    """Coordinator-held pins, not claims populated by parsing the mounted files."""
+    mode: str
+    admit_before: int
+    hard_stop: int
+    packet_sha256: str
+    permit_sha256: str
+    run_sha256: str
+    view_sha256: str
+    approval_sha256: str | None = None
+    final_freeze_sha256: str | None = None
+
+    def __post_init__(self):
+        if (self.mode not in PHASES
+                or not all(map(_pin, (self.packet_sha256, self.permit_sha256, self.run_sha256, self.view_sha256)))
+                or type(self.admit_before) is not int or type(self.hard_stop) is not int
+                or not 0 < self.admit_before <= self.hard_stop < 2**53):
+            raise ValueError("invalid phase admission")
+        final = self.mode == "final"
+        if not (_pin(self.final_freeze_sha256) and self.approval_sha256 is None if final
+                else _pin(self.approval_sha256) and self.final_freeze_sha256 is None):
+            raise ValueError("phase requires its own release")
+
+    def evidence(self):
+        release = ("final_freeze_sha256" if self.mode == "final" else "approval_sha256")
+        return {"run_sha256": self.run_sha256, "view_sha256": self.view_sha256, release: getattr(self, release)}
+
+    def check_start(self, now):
+        if now >= min(self.admit_before, self.hard_stop - 15):
+            raise TimeoutError
+        if self.hard_stop - now > 3600:
+            raise ValueError("unbounded phase")
+
+
+def view_sha256(view):
+    """Hash the complete JSON view descriptor; no whitespace, newline or omitted fields."""
+    return hashlib.sha256(_canonical(view)).hexdigest()
+
+
+def phase_packet(raw, permit_bytes, gate: PhaseGate):
+    """Read only a permit of the independently admitted role. Returns packet, window, plan, view."""
+    from .transport import _json
+    if (len(raw) > 8192 or len(permit_bytes) > PERMIT_LIMIT
+            or hashlib.sha256(raw).hexdigest() != gate.packet_sha256
+            or hashlib.sha256(permit_bytes).hexdigest() != gate.permit_sha256):
+        raise ValueError("unbound phase packet or permit")
+    obj, permit = _json(raw), _json(permit_bytes)
+    release = gate.evidence()
+    expected = {"schema": f"joey-{gate.mode}-permit/v1", "split": gate.mode, "admit_before": gate.admit_before,
+                "hard_stop": gate.hard_stop, **{k: v for k, v in release.items() if k != "view_sha256"}}
+    if (type(permit) is not dict or set(permit) != expected.keys() | {"not_before", "view", "methods"}
+            or any(type(permit[k]) is not type(v) or permit[k] != v for k, v in expected.items())):
+        raise ValueError("phase release or interval differs")
+    earliest = permit["not_before"]
+    if type(earliest) is not int or not 0 < earliest < gate.admit_before or gate.hard_stop - earliest > 3600:
+        raise ValueError("invalid phase release window")
+    if time.time() < earliest:
+        raise TimeoutError
+    view = permit["view"]
+    fields = {"schema", "split", "projection", "inputs_sha256", "split_manifest_sha256", "rows", "bytes"}
+    if gate.mode == "public-development":
+        fields.add("menu_sha256")
+    if (type(view) is not dict or set(view) != fields or view_sha256(view) != gate.view_sha256
+            or view["schema"] != "joey-label-free-view/v1" or view["split"] != gate.mode
+            or view["projection"] != PHASES[gate.mode]
+            or not all(_pin(view[k]) for k in fields if k.endswith("_sha256"))
+            or type(view["rows"]) is not int or not 0 < view["rows"] <= 20000
+            or type(view["bytes"]) is not int or not 0 < view["bytes"] <= 64 * 2**20):
+        raise ValueError("invalid phase view")
+    envelope = _SELECTION_ENVELOPE | {"view_sha256"}
+    if (type(obj) is not dict or not envelope <= obj.keys() or type(obj["schema"]) is not int or obj["schema"] != 1
+            or obj["split"] != gate.mode or obj["view_sha256"] != gate.view_sha256
+            or obj["inputs_sha256"] != view["inputs_sha256"] or obj["permit_sha256"] != gate.permit_sha256
+            or not _pin(obj["method_sha256"]) or type(obj["deadline_utc"]) is not int
+            or obj["deadline_utc"] != gate.hard_stop):
+        raise ValueError("phase packet differs from frozen view")
+    return (*_nominated(obj, permit["methods"], envelope), view)
+
+
+def phase_rows(raw, view):
+    from .transport import _json
+    if len(raw) != view["bytes"] or hashlib.sha256(raw).hexdigest() != view["inputs_sha256"]:
+        raise ValueError("phase shard differs")
+    seen, rows = set(), []
+    for line in BytesIO(raw):
+        row = _json(line)
+        input_sha256(row)  # Same label-free schema as discovery; no projection/label stripping here.
+        if len(rows) >= view["rows"] or row["id"] in seen or len(row["choices"]) > 255:
+            raise ValueError("phase row inventory differs")
+        if view["split"] == "public-development" and (
+                len(row["choices"]) != 77 or hashlib.sha256(_canonical(row["choices"])).hexdigest() != view["menu_sha256"]):
+            raise ValueError("public train requires the approved ordered 77-choice research menu")
+        seen.add(row["id"])
+        rows.append(row)
+    if len(rows) != view["rows"]:
+        raise ValueError("phase row count differs")
+    return rows
 
 
 def _measure_ensemble(native, row, window, plan, split, *, second):
@@ -243,7 +353,22 @@ def run(args) -> None:
         raise ValueError("offline loader flags are required")
     selection = getattr(args, "selection", False)
     nomination_pin = getattr(args, "nomination_sha256", None)
-    if selection:
+    phase = getattr(args, "phase", None)
+    gate = None
+    evidence_names = ("run_sha256", "view_sha256", "approval_sha256", "final_freeze_sha256")
+    if phase is not None:
+        from . import transport
+        if (selection or nomination_pin is not None or phase not in PHASES
+                or args.packet != transport.ADMISSION / "packet.json" or args.model_dir != transport.STAGED / "model"
+                or args.inputs != transport.STAGED / "inputs" / (phase + ".jsonl")
+                or args.compact_dir not in (None, transport.STAGED / "compact")):
+            raise ValueError("wrong phase launch")
+        gate = PhaseGate(phase, args.admit_before, args.hard_stop, args.packet_sha256, args.phase_permit_sha256,
+                         **{k: getattr(args, k) for k in evidence_names})
+        obj, window, plan, rows = transport._phase_inputs(gate)
+    elif any(getattr(args, k, None) is not None for k in (*evidence_names, "phase_permit_sha256", "admit_before", "hard_stop")):
+        raise ValueError("phase fields on a legacy launch")
+    elif selection:
         from . import transport
         if (not _pin(nomination_pin) or args.packet != transport.ADMISSION / "packet.json"
                 or args.inputs != transport.STAGED / "inputs/selection.jsonl"
@@ -260,7 +385,7 @@ def run(args) -> None:
     # The coordinator binds a stricter absolute cutoff to this exact packet.
     # The OS alarm also covers initialization and time spent inside native code.
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
-    remaining = obj["deadline_utc"] - time.time()
+    remaining = obj["deadline_utc"] - (15 if gate else 0) - time.time()
     if remaining <= 0:
         raise ValueError("worker deadline elapsed before start")
     signal.setitimer(signal.ITIMER_REAL, remaining)
@@ -270,7 +395,7 @@ def run(args) -> None:
             raise ValueError("selection shard differs from permit")
         rows = [transport._json(s) for s in shard.splitlines()]
         del shard
-    else:
+    elif gate is None:
         rows = [json.loads(s) for s in _load(args.inputs, obj["inputs_sha256"]).splitlines()]
     if not 0 < len(rows) <= 20000 or len({r["id"] for r in rows}) != len(rows):
         raise ValueError("invalid tier or duplicate decision IDs")
@@ -319,7 +444,8 @@ def run(args) -> None:
     policy = _policy(obj["policy"]) if "policy" in obj else None
     # Parity uses fixed public cases. Don't observe any extra study row for
     # promotion or spend controls; retain the existing discovery warmup otherwise.
-    if not selection and ensemble is None:
+    frozen = selection or gate is not None
+    if not frozen and ensemble is None:
         measure_choice(native, rows[0], window, plan, reverse=obj["reverse"], policy=policy, split=split)
     torch.cuda.synchronize()
     warmup_s = time.perf_counter() - begin
@@ -328,7 +454,7 @@ def run(args) -> None:
     times = []
     outputs = [args.output / "predictions.partial", args.output / "trace.partial"]
     names = ("predictions.jsonl", "trace.jsonl")
-    digests = {name: hashlib.sha256() for name in names} if selection else {}
+    digests = {name: hashlib.sha256() for name in names} if frozen else {}
     with outputs[0].open("xb") as predictions, outputs[1].open("xb") as traces:
         for row in rows:
             torch.cuda.synchronize()
@@ -344,7 +470,7 @@ def run(args) -> None:
                 spend["forward_calls"] += diagnostic["forward_calls"]
                 spend["layer_calls"] += diagnostic["layer_calls"]
                 spend["coda_calls"] += diagnostic["callback_counts"]["coda_calls"]
-            if selection:
+            if frozen:
                 diagnostic["packet_sha256"] = args.packet_sha256
             end.record()
             torch.cuda.synchronize()
@@ -354,7 +480,7 @@ def run(args) -> None:
             for name, f, rec in zip(names, (predictions, traces), (pred, diagnostic), strict=True):
                 line = (json.dumps(rec, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
                 f.write(line)
-                if selection:
+                if frozen:
                     digests[name].update(line)
                 f.flush()
                 os.fsync(f.fileno())
@@ -370,9 +496,11 @@ def run(args) -> None:
     if "compact_manifest_sha256" in obj:
         info.update(compact_manifest_sha256=obj["compact_manifest_sha256"], reload_parity=asdict(native.reload_report),
                     physical_layers=len(native.physical_to_source))
-    if selection:
+    if frozen:
         info.update((k, obj[k]) for k in ("split", "inputs_sha256", "permit_sha256", "method_sha256"))
         info["result_sha256"] = {name: digest.hexdigest() for name, digest in digests.items()}
+    if gate is not None:
+        info.update(gate.evidence())
     if ensemble is not None:
         info["compute_spend"] = spend
     for f, name in zip(outputs, names, strict=True):
@@ -406,13 +534,18 @@ def _quiet_native():
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     for name in ("packet", "inputs", "model-dir", "output"):
         p.add_argument("--" + name, type=Path, required=True)
     p.add_argument("--compact-dir", type=Path)
     p.add_argument("--packet-sha256", required=True)
     p.add_argument("--selection", action="store_true")
     p.add_argument("--nomination-sha256")
+    p.add_argument("--phase", choices=tuple(PHASES))
+    for name in ("phase-permit", "run", "view", "approval", "final-freeze"):
+        p.add_argument("--" + name + "-sha256")
+    p.add_argument("--admit-before", type=int)
+    p.add_argument("--hard-stop", type=int)
     args = p.parse_args(argv)
     try:
         with _quiet_native():

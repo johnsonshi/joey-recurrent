@@ -23,13 +23,14 @@ import sys
 import time
 from types import MappingProxyType
 
+from .worker import PHASES, PhaseGate
 
 HOST, PORT = "127.0.0.1", 18765
 WORK, STAGED, ADMISSION = Path("/work"), Path("/staged"), Path("/admission")
 SOURCE = Path(__file__).resolve().parents[1]
 RESERVE = 15
 _SCHEMA = "joey-loopback/v1"
-_SHARDS = {"discovery": "discovery.jsonl", "selection": "selection.jsonl"}
+_SHARDS = {mode: mode + ".jsonl" for mode in ("discovery", "selection", *PHASES)}
 _MI = 1024 * 1024
 _LIMIT = {"probe.json": 8192, "challenge.bin": 65536, "predictions.jsonl": 64 * _MI,
           "trace.jsonl": 128 * _MI, "complete.json": 64 * 1024}
@@ -97,6 +98,10 @@ class Attempt:
     packet_sha256: str | None = None
     requirements_sha256: str | None = None
     permit_sha256: str | None = None
+    run_sha256: str | None = None
+    view_sha256: str | None = None
+    approval_sha256: str | None = None
+    final_freeze_sha256: str | None = None
 
     def __post_init__(self):
         _require((self.mode == "probe" or self.mode in _SHARDS) and _pin(self.nonce))
@@ -104,7 +109,15 @@ class Attempt:
                  and 0 < self.admit_before <= self.hard_stop < 2**53)
         pins = (self.packet_sha256, self.requirements_sha256)
         _require(all(map(_pin, pins)) if self.mode in _SHARDS else pins == (None, None))
-        _require(_pin(self.permit_sha256) if self.mode == "selection" else self.permit_sha256 is None)
+        if self.mode in PHASES:
+            self.phase_gate()
+        else:
+            _require(_pin(self.permit_sha256) if self.mode == "selection" else self.permit_sha256 is None)
+            _require(all(p is None for p in (self.run_sha256, self.view_sha256, self.approval_sha256, self.final_freeze_sha256)))
+
+    def phase_gate(self):
+        return PhaseGate(self.mode, self.admit_before, self.hard_stop, self.packet_sha256, self.permit_sha256,
+                         self.run_sha256, self.view_sha256, self.approval_sha256, self.final_freeze_sha256)
 
     @property
     def nonce_sha256(self):
@@ -118,8 +131,10 @@ class Attempt:
         result = {"schema": _SCHEMA, "mode": self.mode, "nonce_sha256": self.nonce_sha256,
                   "admit_before": self.admit_before, "hard_stop": self.hard_stop,
                   "packet_sha256": self.packet_sha256, "requirements_sha256": self.requirements_sha256}
-        if self.mode == "selection":
+        if self.permit_sha256 is not None:
             result["permit_sha256"] = self.permit_sha256
+        if self.mode in PHASES:
+            result.update(self.phase_gate().evidence())
         return result
 
 
@@ -132,13 +147,16 @@ def _directory(path, parent=None):
         os.close(fd)
 
 
-def _read(directory, name, limit):
+def _read(directory, name, limit, *, durable=False):
     fd = os.open(name, _FILE_FLAGS, dir_fd=directory)
     with os.fdopen(fd, "rb") as stream:
         st = os.fstat(fd)
         _require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and 0 < st.st_size <= limit)
         data = stream.read(st.st_size + 1)
         _require(len(data) == st.st_size)
+        if durable:
+            _require(st.st_uid == os.geteuid() and not st.st_mode & 0o077)
+            os.fsync(fd)
         return data
 
 
@@ -161,7 +179,8 @@ def _inventory(directory, names):
 
 def _admission_bytes(name):
     from .worker import PERMIT_LIMIT
-    limit = {"packet.json": 8192, "nomination.json": PERMIT_LIMIT}[name]
+    limit = {"packet.json": 8192, "nomination.json": PERMIT_LIMIT,
+             **{mode + "-permit.json": PERMIT_LIMIT for mode in PHASES}}[name]
     # Kube's immutable projected ConfigMap normally uses this two-link layout.
     # Never follow a caller-supplied symlink out of the mount.
     with _directory(ADMISSION) as root:
@@ -211,6 +230,15 @@ def _selection(attempt):
     _require(attempt.mode == "selection")
     packet, _, _ = _read_selection_packet(attempt.packet_sha256, attempt.permit_sha256)
     return _bind_inputs(packet, attempt)
+
+
+def _phase_inputs(gate):
+    from .worker import phase_packet, phase_rows
+    gate.check_start(time.time())
+    packet, window, plan, view = phase_packet(_packet_bytes(), _admission_bytes(gate.mode + "-permit.json"), gate)
+    rows = phase_rows(_shard_bytes(gate.mode), view)
+    gate.check_start(time.time())
+    return packet, window, plan, rows
 
 
 def _bind_inputs(packet, attempt):
@@ -299,13 +327,16 @@ def _probe_child():
 
 def _completion_binding(metrics, attempt, jsonl_pins):
     _require(metrics["packet_sha256"] == attempt.packet_sha256)
-    if attempt.mode == "selection":
-        _require(metrics.get("split") == "selection" and metrics.get("permit_sha256") == attempt.permit_sha256
+    if attempt.permit_sha256 is not None:
+        _require(metrics.get("split") == attempt.mode and metrics.get("permit_sha256") == attempt.permit_sha256
                  and _pin(metrics.get("method_sha256")) and _pin(metrics.get("inputs_sha256"))
                  and metrics.get("result_sha256") == jsonl_pins)
     else:
         _require(metrics.get("split", "discovery") == "discovery"
                  and not {"permit_sha256", "method_sha256"} & metrics.keys())
+    phase = attempt.phase_gate().evidence() if attempt.mode in PHASES else {}
+    for k in ("run_sha256", "view_sha256", "approval_sha256", "final_freeze_sha256"):
+        _require(metrics.get(k) == phase[k] if k in phase else k not in metrics)
 
 
 def _outputs(run, packet, rows, attempt):
@@ -315,8 +346,8 @@ def _outputs(run, packet, rows, attempt):
         files = {name: _read(out, name, _LIMIT[name]) for name in _FILES["complete"]}
     metrics = _json(files["complete.json"])
     _completion_binding(metrics, attempt, {n: _sha(files[n]) for n in ("predictions.jsonl", "trace.jsonl")}
-                        if attempt.mode == "selection" else None)
-    if attempt.mode == "selection":
+                        if attempt.permit_sha256 is not None else None)
+    if attempt.permit_sha256 is not None:
         _require(all(metrics[k] == packet[k] for k in ("split", "permit_sha256", "method_sha256", "inputs_sha256")))
     _require(_integer(metrics["schema"], 1, 1)
              and _integer(metrics["decisions"], len(rows), len(rows)) and _integer(metrics["batch_size"], 1, 1)
@@ -341,7 +372,7 @@ def _outputs(run, packet, rows, attempt):
                  and abs(math.fsum(pred["probs"]) - 1) <= 1e-6
                  and {"tokens", "layer_calls", "readouts", "wall_ms", "cuda_event_ms",
                       "callback_counts"} <= set(trace))
-        if attempt.mode == "selection":
+        if attempt.permit_sha256 is not None:
             _require(trace.get("packet_sha256") == attempt.packet_sha256)
         if ensemble is not None:
             n = 1 + int(row.group in selected)
@@ -485,7 +516,13 @@ def _result(attempt):
                 return "setup_probe", {"probe.json": _encoded(dict(doc, nonce_sha256=attempt.nonce_sha256)),
                                        "challenge.bin": verified}
 
-            packet, rows = _selection(attempt) if attempt.mode == "selection" else _discovery(attempt)
+            if attempt.mode in PHASES:
+                from .evaluation import input_sha256
+                packet, _, _, records = _phase_inputs(attempt.phase_gate())
+                rows = {r["id"]: _Decision(input_sha256(r), len(r["choices"]), r["task"], r["group_id"]) for r in records}
+                del records
+            else:
+                packet, rows = _selection(attempt) if attempt.mode == "selection" else _discovery(attempt)
             _verify_lock(attempt)
             os.mkdir("site", 0o700, dir_fd=work)
             _phase(attempt, [sys.executable, "-IB", "-m", "pip", "--isolated", "--disable-pip-version-check",
@@ -497,6 +534,11 @@ def _result(attempt):
                     "--inputs", str(STAGED / "inputs" / _SHARDS[attempt.mode]), "--output", str(WORK / "run/out")]
             if attempt.mode == "selection":
                 argv += ["--selection", "--nomination-sha256", attempt.permit_sha256]
+            elif attempt.mode in PHASES:
+                argv += ["--phase", attempt.mode, "--phase-permit-sha256", attempt.permit_sha256,
+                         "--admit-before", str(attempt.admit_before), "--hard-stop", str(attempt.hard_stop)]
+                for key, pin in attempt.phase_gate().evidence().items():
+                    argv += ["--" + key.replace("_", "-"), pin]
             if "compact_manifest_sha256" in packet and "compact_recipe" not in packet:
                 argv += ["--compact-dir", str(STAGED / "compact")]
             _phase(attempt, argv, cwd="/", installed=True)
@@ -675,7 +717,24 @@ def _exchange(port, attempt, target, limit, *, ack=None):
         return body
 
 
-def _verified_bytes(port, attempt, destination):
+def _check_local(local, raw, doc, attempt, *, durable=False):
+    _inventory(local, {"manifest.json", *doc["files"]})
+    _require(_read(local, "manifest.json", 8192, durable=durable) == raw)
+    for name, record in doc["files"].items():
+        data = _read(local, name, record["bytes"], durable=durable)
+        _require(len(data) == record["bytes"] and _sha(data) == record["sha256"])
+        if name == "challenge.bin":
+            _require(data == _challenge(attempt))
+        elif name == "probe.json":
+            probe = _json(data)
+            _require(probe.pop("nonce_sha256") == attempt.nonce_sha256)
+            _validate_probe(probe)
+        elif name == "complete.json":
+            _completion_binding(_json(data), attempt,
+                                {n: doc["files"][n]["sha256"] for n in ("predictions.jsonl", "trace.jsonl")})
+
+
+def _verified_bytes(port, attempt, destination, *, receipt_sha256=None):
     destination = Path(destination).absolute()
     parent = destination.parent
     _require(parent.resolve(strict=True) == parent and destination.name not in ("", ".", ".."))
@@ -684,6 +743,8 @@ def _verified_bytes(port, attempt, destination):
         st = os.fstat(base)
         _require(st.st_uid == os.geteuid() and not st.st_mode & 0o077)
         raw = _exchange(port, attempt, "/manifest", 8192)
+        if receipt_sha256 is not None:
+            _require(attempt.mode in PHASES and _pin(receipt_sha256) and _sha(raw) == receipt_sha256)
         doc = _json(raw)
         _validate_manifest(doc, attempt)
         os.mkdir(stage, 0o700, dir_fd=base)  # Exclusive per-destination writer.
@@ -696,19 +757,7 @@ def _verified_bytes(port, attempt, destination):
                     _require(len(data) == record["bytes"] and _sha(data) == record["sha256"])
                     _persist(local, name, data)
                 os.fsync(local)
-                _require(_read(local, "manifest.json", 8192) == raw)
-                for name, record in doc["files"].items():
-                    data = _read(local, name, record["bytes"])
-                    _require(len(data) == record["bytes"] and _sha(data) == record["sha256"])
-                    if name == "challenge.bin":
-                        _require(data == _challenge(attempt))
-                    elif name == "probe.json":
-                        probe = _json(data)
-                        _require(probe.pop("nonce_sha256") == attempt.nonce_sha256)
-                        _validate_probe(probe)
-                    elif name == "complete.json":
-                        _completion_binding(_json(data), attempt,
-                                            {n: doc["files"][n]["sha256"] for n in ("predictions.jsonl", "trace.jsonl")})
+                _check_local(local, raw, doc, attempt)
             try:
                 os.stat(destination.name, dir_fd=base, follow_symlinks=False)
             except FileNotFoundError:
@@ -731,7 +780,8 @@ def _verified_bytes(port, attempt, destination):
 
 
 def collect(port, destination, *, mode, nonce, admit_before, hard_stop, packet_sha256=None, requirements_sha256=None,
-            permit_sha256=None):
+            permit_sha256=None, run_sha256=None, view_sha256=None, approval_sha256=None, final_freeze_sha256=None,
+            receipt_sha256=None):
     """Collect from an already-authorized local forward; no workload API or credentials.
 
     Use a new destination in a private single-writer directory. Returns the
@@ -739,11 +789,51 @@ def collect(port, destination, *, mode, nonce, admit_before, hard_stop, packet_s
     directory remains; a second collection cannot overwrite it.
     """
     try:
-        attempt = Attempt(mode, nonce, admit_before, hard_stop, packet_sha256, requirements_sha256, permit_sha256)
+        attempt = Attempt(mode, nonce, admit_before, hard_stop, packet_sha256, requirements_sha256, permit_sha256,
+                          run_sha256, view_sha256, approval_sha256, final_freeze_sha256)
         _require(_integer(port, 1, 65535) and _remaining(hard_stop) <= 3600)
-        return _verified_bytes(port, attempt, destination)
+        return _verified_bytes(port, attempt, destination, receipt_sha256=receipt_sha256)
     except Exception:
         raise TransportError("collection not confirmed") from None
+
+
+def pin_receipt(port, attempt: Attempt):
+    """Retain this independent live pin in the coordinator journal before collecting a phase."""
+    try:
+        _require(type(attempt) is Attempt and attempt.mode in PHASES and _integer(port, 1, 65535)
+                 and _remaining(attempt.hard_stop) <= 3600)
+        raw = _exchange(port, attempt, "/manifest", 8192)
+        _validate_manifest(_json(raw), attempt)
+        return _sha(raw)
+    except Exception:
+        raise TransportError("receipt not confirmed") from None
+
+
+def recover(destination, *, attempt: Attempt, receipt_sha256, port=None):
+    """Verify complete local custody; optionally ACK the identical still-live exporter. Never retry inference."""
+    try:
+        _require(type(attempt) is Attempt and attempt.mode in PHASES and _pin(receipt_sha256))
+        dest = Path(destination).absolute()
+        _require(dest.parent.resolve(strict=True) == dest.parent and dest.name not in ("", ".", ".."))
+        with _directory(dest.parent) as parent, _directory(dest.name, parent) as local:
+            for fd in (parent, local):
+                st = os.fstat(fd)
+                _require(st.st_uid == os.geteuid() and not st.st_mode & 0o077)
+            raw = _read(local, "manifest.json", 8192)
+            _require(_sha(raw) == receipt_sha256)
+            doc = _json(raw)
+            _validate_manifest(doc, attempt)
+            _check_local(local, raw, doc, attempt, durable=True)
+            os.fsync(local)
+            os.fsync(parent)
+        if port is not None:
+            _require(_integer(port, 1, 65535) and _remaining(attempt.hard_stop) <= 3600
+                     and _exchange(port, attempt, "/manifest", 8192) == raw)
+            ack = _encoded({"nonce": attempt.nonce, "receipt_sha256": receipt_sha256})
+            _exchange(port, attempt, "/ack", 0, ack=ack)
+        return doc
+    except Exception:
+        raise TransportError("recovery not confirmed") from None
 
 
 class _Parser(argparse.ArgumentParser):
@@ -754,14 +844,20 @@ class _Parser(argparse.ArgumentParser):
 def main(argv=None):
     try:
         parser = _Parser(prog="python -m joey_research.transport", allow_abbrev=False)
-        parser.add_argument("mode", choices=("probe", "discovery", "selection"))
+        parser.add_argument("mode", choices=("probe", *_SHARDS))
         parser.add_argument("--admit-before", type=int, required=True)
         parser.add_argument("--hard-stop", type=int, required=True)
         parser.add_argument("--packet-sha256")
         parser.add_argument("--requirements-sha256")
-        parser.add_argument("--nomination-sha256", dest="permit_sha256")
+        parser.add_argument("--nomination-sha256")
+        for name in ("phase-permit", "view", "run", "approval", "final-freeze"):
+            parser.add_argument("--" + name + "-sha256")
         args = parser.parse_args(argv)
-        attempt = Attempt(nonce=os.environ.pop("JOEY_EXPORT_NONCE", ""), **vars(args))
+        supplied = vars(args)
+        nomination, phase = supplied.pop("nomination_sha256"), supplied.pop("phase_permit_sha256")
+        _require(nomination is None if args.mode in PHASES else phase is None)
+        attempt = Attempt(nonce=os.environ.pop("JOEY_EXPORT_NONCE", ""),
+                          permit_sha256=phase if args.mode in PHASES else nomination, **supplied)
         _require(_remaining(attempt.hard_stop) <= 3600)
         libc = _linux()
         os.umask(0o077)
