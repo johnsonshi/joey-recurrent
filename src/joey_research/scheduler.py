@@ -15,6 +15,12 @@ from typing import Callable, Iterable, Iterator, Protocol
 
 
 HOUR = 3600
+FREEZE_AFTER_S = 23 * HOUR
+FINALIZE_AFTER_S = 25 * HOUR
+WALL_TARGET_S = 26 * HOUR
+MAX_EXTENSION_HOURS = 4
+MAX_WALL_S = WALL_TARGET_S + MAX_EXTENSION_HOURS * HOUR
+GPU_CAP_S = 48 * HOUR  # Across both one-A100 slots, not two times the wall target.
 MAX_ATTEMPTS = 3  # Includes the original admission.
 _MAX_UTC = (1 << 62) - 1
 
@@ -121,7 +127,7 @@ class Manifest:
         if not isinstance(self.key, TrialKey) or not isinstance(self.split, Split):
             raise PolicyError("expected a typed key and split")
         _tag(self.gpu_class)
-        _integer(self.budget_s, 1, 24 * HOUR)
+        _integer(self.budget_s, 1, MAX_WALL_S)
 
 
 @dataclass(frozen=True)
@@ -191,7 +197,6 @@ class Backend(Protocol):
 
 
 _SCHEMA = """
-PRAGMA user_version = 1;
 CREATE TABLE run (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1), run_id TEXT NOT NULL,
     start_utc INTEGER NOT NULL, last_seen INTEGER NOT NULL, lease_s INTEGER NOT NULL,
@@ -259,18 +264,54 @@ CREATE VIEW status_counts AS
 """
 
 
+def _terminal_gpu_s(issued_at: int, hard_stop: int, outcome: str, at: int) -> int:
+    if outcome == Outcome.FENCED_ABSENT:
+        return 0  # Irreversible proof that this token never started.
+    # Timestamps have only second precision. Include the partial terminal second,
+    # but not past the enforced stop unless the evidence itself is later.
+    end = hard_stop if at == hard_stop else at + 1
+    return end - issued_at
+
+
+def _install_budget(db: sqlite3.Connection, start: int, offsets: tuple[int, int, int],
+                    prior_gpu_s: int = 0) -> None:
+    """Called inside the creation/upgrade transaction; v1 evidence is never rewritten."""
+    db.execute("CREATE TABLE run_budget (singleton INTEGER PRIMARY KEY CHECK(singleton=1) REFERENCES run, "
+               "freeze_at INTEGER NOT NULL, finalize_at INTEGER NOT NULL, deadline INTEGER NOT NULL, "
+               "cap_s INTEGER NOT NULL, charged_s INTEGER NOT NULL CHECK(charged_s>=0))")
+    db.execute("CREATE TRIGGER pinned_run_limits BEFORE UPDATE OF singleton,freeze_at,finalize_at,deadline,cap_s "
+               "ON run_budget BEGIN SELECT RAISE(ABORT,'immutable run limits'); END")
+    db.execute("CREATE TRIGGER monotone_gpu_charge BEFORE UPDATE OF charged_s ON run_budget "
+               "WHEN NEW.charged_s<OLD.charged_s BEGIN SELECT RAISE(ABORT,'cannot reduce GPU charges'); END")
+    charged = prior_gpu_s
+    for r in db.execute("SELECT issued_at,hard_stop,observation FROM attempts LEFT JOIN receipts USING(token) "
+                        "WHERE state='closed'"):
+        if r["observation"] is None:
+            raise PolicyError("cannot resume a closed attempt without terminal evidence")
+        observation = json.loads(r["observation"])
+        charged += _terminal_gpu_s(r["issued_at"], r["hard_stop"], observation["outcome"], observation["at"])
+    db.execute("INSERT INTO run_budget VALUES(1,?,?,?,?,?)",
+               (*(start + offset for offset in offsets), GPU_CAP_S, charged))
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS once_extension ON events(kind) WHERE kind='timing_extended'")
+    db.execute("CREATE UNIQUE INDEX IF NOT EXISTS reservation_event ON events(token) WHERE kind='reserved'")
+    db.execute("PRAGMA user_version = 2")
+
+
 class Queue:
     """Use one connection per thread/process and a single durable DB per experiment."""
 
     def __init__(self, db: sqlite3.Connection, clock: Callable[[], int]):
         self._db = db
         self._clock = clock
-        row = self._db.execute("SELECT * FROM run WHERE singleton=1").fetchone()
+        row = self._db.execute("SELECT * FROM run JOIN run_budget USING(singleton) WHERE singleton=1").fetchone()
         if row is None:
             raise PolicyError("missing experiment origin; do not recreate an active queue")
         self._run_id = row["run_id"]
         self._start_utc = row["start_utc"]
         self._lease_s = row["lease_s"]
+        self._scheduled_freeze = row["freeze_at"]
+        self._test_window_s = row["finalize_at"] - row["freeze_at"]
+        self._nominal_deadline = row["deadline"]
 
     @property
     def run_id(self) -> str:
@@ -286,15 +327,29 @@ class Queue:
 
     @property
     def freeze_at(self) -> int:
-        return self.start_utc + 21 * HOUR
+        seal = self._db.execute("SELECT effective_at FROM seals WHERE name='freeze'").fetchone()
+        if seal:
+            return seal[0]
+        extension = self._extension()
+        return extension["freeze_at"] if extension else self._scheduled_freeze
 
     @property
     def finalize_at(self) -> int:
-        return self.start_utc + 23 * HOUR
+        seal = self._db.execute("SELECT effective_at FROM seals WHERE name='finalize'").fetchone()
+        return seal[0] if seal else self.freeze_at + self._test_window_s
+
+    @property
+    def nominal_deadline(self) -> int:
+        return self._nominal_deadline
+
+    def _extension(self) -> dict | None:
+        r = self._db.execute("SELECT utc,detail FROM events WHERE kind='timing_extended'").fetchone()
+        return {**json.loads(r["detail"]), "recorded_at": r["utc"]} if r else None
 
     @property
     def deadline(self) -> int:
-        return self.start_utc + 24 * HOUR
+        extension = self._extension()
+        return extension["deadline"] if extension else self.nominal_deadline
 
     @staticmethod
     def _connect(path: Path) -> sqlite3.Connection:
@@ -307,13 +362,14 @@ class Queue:
 
     @classmethod
     def create(cls, path: str | Path, *, run_id: str, start_utc: int,
-               gpu_classes: tuple[str, str], lease_s: int = 90,
+               gpu_classes: tuple[str, str], lease_s: int = 90, prior_gpu_s: int = 0,
                clock: Callable[[], int] = _utc) -> Queue:
-        """start_utc is the original experiment start, including all setup."""
+        """start_utc is the first verified post-setup UTC, not the setup launch."""
         _digest(run_id)
         now = _integer(clock(), 0, _MAX_UTC)
-        _integer(start_utc, 0, min(now, _MAX_UTC - 24 * HOUR))
+        _integer(start_utc, 0, min(now, _MAX_UTC - MAX_WALL_S))
         _integer(lease_s, 1, HOUR)
+        _integer(prior_gpu_s, 0, GPU_CAP_S)
         if not isinstance(gpu_classes, tuple) or len(gpu_classes) != 2:
             raise PolicyError("bind exactly two physical slots")
         for gpu_class in gpu_classes:
@@ -330,9 +386,10 @@ class Queue:
                                "BEGIN SELECT RAISE(ABORT,'immutable evidence'); END")
             db.execute("INSERT INTO run(singleton,run_id,start_utc,last_seen,lease_s) "
                        "VALUES(1,?,?,?,?)", (run_id, start_utc, now, lease_s))
+            _install_budget(db, start_utc, (FREEZE_AFTER_S, FINALIZE_AFTER_S, WALL_TARGET_S), prior_gpu_s)
             db.executemany("INSERT INTO slots VALUES(?,?)", enumerate(gpu_classes))
             queue = cls(db, clock)
-            queue._event(now, "created", detail={"start_utc": start_utc})
+            queue._event(now, "created", detail={"start_utc": start_utc, "prior_gpu_s": prior_gpu_s})
             queue._advance(now)
             db.commit()
             return queue
@@ -345,13 +402,20 @@ class Queue:
         _digest(run_id)
         db = cls._connect(Path(path))
         try:
-            if db.execute("PRAGMA user_version").fetchone()[0] != 1:
+            db.execute("BEGIN IMMEDIATE")
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version == 1:
+                row = db.execute("SELECT run_id,start_utc FROM run WHERE singleton=1").fetchone()
+                if row is None or row["run_id"] != run_id:
+                    raise PolicyError("run identity mismatch")
+                _install_budget(db, row["start_utc"], (21 * HOUR, 23 * HOUR, 24 * HOUR))
+            elif version != 2:
                 raise PolicyError("unsupported or incomplete queue database")
             queue = cls(db, clock)
             if queue.run_id != run_id:
                 raise PolicyError("run identity mismatch")
-            with queue._transaction():
-                pass
+            queue._witness()
+            db.commit()
             return queue
         except BaseException:
             db.close()
@@ -360,16 +424,20 @@ class Queue:
     def close(self) -> None:
         self._db.close()
 
+    def _witness(self) -> int:
+        now = _integer(self._clock(), 0, _MAX_UTC)
+        previous = self._db.execute("SELECT last_seen FROM run").fetchone()[0]
+        if now < previous:
+            raise ClockRegression("UTC regressed; no admission until the clock is trustworthy")
+        self._db.execute("UPDATE run SET last_seen=?", (now,))
+        self._advance(now)
+        return now
+
     @contextmanager
     def _transaction(self) -> Iterator[int]:
         self._db.execute("BEGIN IMMEDIATE")
         try:
-            now = _integer(self._clock(), 0, _MAX_UTC)
-            previous = self._db.execute("SELECT last_seen FROM run").fetchone()[0]
-            if now < previous:
-                raise ClockRegression("UTC regressed; no admission until the clock is trustworthy")
-            self._db.execute("UPDATE run SET last_seen=?", (now,))
-            self._advance(now)
+            now = self._witness()
             self._db.execute("SAVEPOINT operation")
             try:
                 yield now
@@ -393,45 +461,61 @@ class Queue:
             return "search"
         if now < self.finalize_at:
             return "test"
-        return "finalize" if now < self.deadline else "closed"
+        return "closed" if self._db.execute("SELECT closed FROM run").fetchone()[0] else "finalize"
 
-    def _seal(self, name: str, effective: int, now: int, payload: dict) -> None:
+    def _seal(self, name: str, effective: int, now: int, payload: dict, reason_sha: str | None) -> None:
         value = {"run_id": self.run_id, "name": name, "effective_at": effective, **payload}
+        if reason_sha is not None:
+            value["reason_sha"] = reason_sha
         digest = _hash(value)
         self._db.execute("INSERT INTO seals VALUES(?,?,?,?,?)",
                          (name, effective, now, digest, _json(value)))
         self._event(now, name, detail={"effective_at": effective, "sha256": digest})
 
+    def _freeze(self, effective: int, now: int, reason_sha: str | None = None) -> None:
+        db = self._db
+        proposal = db.execute("SELECT proposal FROM run").fetchone()[0]
+        plan = json.loads(proposal) if proposal else {"decision_sha": None, "picks": []}
+        self._seal("freeze", effective, now, plan, reason_sha)
+        db.executemany("UPDATE trials SET state='queued' WHERE id=? AND state='candidate'",
+                       ((p["test_id"],) for p in plan["picks"]))
+        db.execute("UPDATE trials SET state='not_selected' WHERE state='candidate'")
+        db.execute("UPDATE trials SET state='expired' WHERE state='queued' AND split='dev'")
+
+    def _finalize(self, effective: int, now: int, reason_sha: str | None = None) -> None:
+        db = self._db
+        db.execute("UPDATE trials SET state='expired' WHERE state='queued'")
+        freeze = db.execute("SELECT sha256,payload FROM seals WHERE name='freeze'").fetchone()
+        ids = {p["test_id"] for p in json.loads(freeze["payload"])["picks"]}
+        results = []
+        for trial in sorted(ids):
+            row = db.execute(
+                "SELECT t.id,t.state,t.result_sha,a.token,r.observation,r.accepted FROM trials t "
+                "LEFT JOIN attempts a ON a.trial_id=t.id LEFT JOIN receipts r ON r.token=a.token "
+                "WHERE t.id=?", (trial,)).fetchone()
+            results.append({"test_id": trial, "state": row["state"], "token": row["token"],
+                            "result_sha": row["result_sha"],
+                            "accepted": bool(row["accepted"]) if row["accepted"] is not None else None,
+                            "receipt": json.loads(row["observation"]) if row["observation"] else None})
+        self._seal("finalize", effective, now, {"freeze_sha": freeze["sha256"], "results": results}, reason_sha)
+
+    def _mark_closed(self, effective: int, now: int, reason_sha: str | None = None) -> None:
+        if self._db.execute("UPDATE run SET closed=1 WHERE closed=0").rowcount:
+            detail: dict[str, int | str] = {"effective_at": effective}
+            if reason_sha is not None:
+                detail["reason_sha"] = reason_sha
+            self._event(now, "closed", detail=detail)
+
     def _advance(self, now: int) -> None:
         db = self._db
-        if now >= self.freeze_at and not db.execute(
-                "SELECT 1 FROM seals WHERE name='freeze'").fetchone():
-            proposal = db.execute("SELECT proposal FROM run").fetchone()[0]
-            plan = json.loads(proposal) if proposal else {"decision_sha": None, "picks": []}
-            self._seal("freeze", self.freeze_at, now, plan)
-            db.executemany("UPDATE trials SET state='queued' WHERE id=? AND state='candidate'",
-                           ((p["test_id"],) for p in plan["picks"]))
-            db.execute("UPDATE trials SET state='not_selected' WHERE state='candidate'")
-            db.execute("UPDATE trials SET state='expired' WHERE state='queued' AND split='dev'")
-        if now >= self.finalize_at and not db.execute(
-                "SELECT 1 FROM seals WHERE name='finalize'").fetchone():
-            db.execute("UPDATE trials SET state='expired' WHERE state='queued'")
-            freeze = db.execute("SELECT sha256,payload FROM seals WHERE name='freeze'").fetchone()
-            ids = {p["test_id"] for p in json.loads(freeze["payload"])["picks"]}
-            results = []
-            for trial in sorted(ids):
-                row = db.execute(
-                    "SELECT t.id,t.state,t.result_sha,a.token,r.observation,r.accepted FROM trials t "
-                    "LEFT JOIN attempts a ON a.trial_id=t.id LEFT JOIN receipts r ON r.token=a.token "
-                    "WHERE t.id=?", (trial,)).fetchone()
-                results.append({"test_id": trial, "state": row["state"], "token": row["token"],
-                                "result_sha": row["result_sha"],
-                                "accepted": bool(row["accepted"]) if row["accepted"] is not None else None,
-                                "receipt": json.loads(row["observation"]) if row["observation"] else None})
-            self._seal("finalize", self.finalize_at, now, {"freeze_sha": freeze["sha256"],
-                                                          "results": results})
-        if now >= self.deadline and db.execute("UPDATE run SET closed=1 WHERE closed=0").rowcount:
-            self._event(now, "closed", detail={"effective_at": self.deadline})
+        freeze = self.freeze_at
+        if now >= freeze and not db.execute("SELECT 1 FROM seals WHERE name='freeze'").fetchone():
+            self._freeze(freeze, now)
+        cutoff = freeze + self._test_window_s
+        if now >= cutoff and not db.execute("SELECT 1 FROM seals WHERE name='finalize'").fetchone():
+            self._finalize(cutoff, now)
+        if now >= self.deadline:
+            self._mark_closed(self.deadline, now)
         stale = db.execute("SELECT token,trial_id FROM attempts WHERE state IN ('reserved','live') "
                            "AND lease_until<=? ORDER BY slot", (now,)).fetchall()
         for row in stale:
@@ -504,7 +588,7 @@ class Queue:
             self._event(now, "gate_passed", trial_id, detail={"gate": gate.value, "proof": proof_sha})
 
     def nominate(self, picks: Iterable[Pick], *, decision_sha: str) -> None:
-        """Replace the complete *dev-only* proposal. At 21h the last proposal is sealed."""
+        """Replace the complete dev-only proposal before its irreversible freeze."""
         _digest(decision_sha)
         entries = list(picks)
         if not all(isinstance(p, Pick) for p in entries):
@@ -534,11 +618,81 @@ class Queue:
                 self._db.execute("UPDATE run SET proposal=?", (encoded,))
                 self._event(now, "nominated", detail=proposal)
 
+    def _require_idle(self) -> None:
+        if self._db.execute("SELECT 1 FROM attempts WHERE state!='closed' LIMIT 1").fetchone():
+            raise PolicyError("a physical reservation is outstanding")
+
+    def extend_once(self, *, hours: int, evidence_sha: str) -> dict:
+        """Authorize one bounded pre-freeze shift. A retry of the same decision adds no time."""
+        _integer(hours, 1, MAX_EXTENSION_HOURS)
+        _digest(evidence_sha)
+        with self._transaction() as now:
+            if now >= self.freeze_at:
+                raise PolicyError("cannot extend a frozen run")
+            prior = self._extension()
+            if prior is not None:
+                if (prior["hours"], prior["evidence_sha"]) != (hours, evidence_sha):
+                    raise PolicyError("the one timing extension has already been used")
+            else:
+                shift = hours * HOUR
+                freeze = self._scheduled_freeze + shift
+                deadline = _integer(self.nominal_deadline + shift, 0, _MAX_UTC)
+                self._event(now, "timing_extended", detail={
+                    "hours": hours, "evidence_sha": evidence_sha, "freeze_at": freeze,
+                    "finalize_at": freeze + self._test_window_s, "deadline": deadline})
+            return self._status(now)
+
+    def freeze_early(self, *, reason_sha: str) -> None:
+        """Seal the current dev-only plan now; move the two-hour held-out window earlier."""
+        _digest(reason_sha)
+        with self._transaction() as now:
+            if now >= self.freeze_at:
+                raise PolicyError("selection is frozen")
+            self._require_idle()
+            self._freeze(now, now, reason_sha)
+
+    def finish_early(self, *, reason_sha: str) -> dict:
+        """Close an idle queue at the witnessed UTC, never skipping a feasible frozen pick."""
+        _digest(reason_sha)
+        with self._transaction() as now:
+            if self._phase(now) == "closed":
+                return self._status(now)
+            self._require_idle()
+            if now < self.freeze_at:
+                self._freeze(now, now, reason_sha)
+            if now < self.finalize_at:
+                available = min(self.finalize_at - now, self._gpu_budget()["remaining_s"])
+                if self._db.execute("SELECT 1 FROM trials WHERE split='test' AND state='queued' "
+                                    "AND budget_s<=? LIMIT 1", (available,)).fetchone():
+                    raise PolicyError("frozen evaluations still fit; finish them before closing early")
+                self._finalize(now, now, reason_sha)
+            self._mark_closed(now, now, reason_sha)
+            return self._status(now)
+
+    def _gpu_budget(self) -> dict:
+        # The two occupied slots hold their *entire* envelopes until an irreversible
+        # receipt settles them. Never discount unknowns, expired leases or the send gap.
+        cap, charged = self._db.execute("SELECT cap_s,charged_s FROM run_budget").fetchone()
+        reserved = 0
+        overrun = False
+        for issued, stop, pulse in self._db.execute(
+                "SELECT issued_at,hard_stop,pulse FROM attempts WHERE state!='closed'"):
+            if pulse is not None and pulse > stop:
+                overrun = True  # No trustworthy upper bound until fenced; withhold all headroom.
+                stop = pulse + 1
+            reserved += stop - issued
+        if overrun:
+            reserved = max(reserved, cap - charged)
+        return {"cap_s": cap, "charged_s": charged, "reserved_s": reserved,
+                "remaining_s": max(0, cap - charged - reserved)}
+
     def _as_ticket(self, row: sqlite3.Row) -> Admission:
+        # A reservation without an override was issued against the pinned nominal target.
+        deadline = json.loads(row["reservation"]).get("run_deadline", self.nominal_deadline)
         return Admission(self.run_id, row["token"], row["trial_id"], row["manifest_sha"],
                          Split(row["split"]), row["ordinal"], row["slot"], row["generation"],
                          row["gpu_class"], row["issued_at"], row["admit_before"], row["hard_stop"],
-                         self.deadline)
+                         deadline)
 
     def reserve(self) -> Admission | None:
         """Durably consume one admission before I/O; only its reserving caller may send it."""
@@ -546,6 +700,7 @@ class Queue:
             if now >= self.finalize_at:
                 return None
             split, cutoff = (Split.DEV, self.freeze_at) if now < self.freeze_at else (Split.TEST, self.finalize_at)
+            available = min(cutoff - now, self._gpu_budget()["remaining_s"])
             row = self._db.execute(
                 "SELECT t.*,s.slot FROM trials t JOIN slots s ON s.gpu_class=t.gpu_class "
                 "WHERE t.split=? AND t.state='queued' AND t.budget_s<=? "
@@ -553,7 +708,7 @@ class Queue:
                 "AND (SELECT COUNT(*) FROM gates g WHERE g.trial_id=t.id)=2 "
                 "AND NOT EXISTS(SELECT 1 FROM dependencies d JOIN trials p ON p.id=d.parent "
                 "               WHERE d.trial_id=t.id AND p.state!='succeeded') "
-                "ORDER BY t.priority,t.id,s.slot LIMIT 1", (split.value, cutoff - now)).fetchone()
+                "ORDER BY t.priority,t.id,s.slot LIMIT 1", (split.value, available)).fetchone()
             if row is None:
                 return None
             slot, tid = row["slot"], row["id"]
@@ -565,20 +720,24 @@ class Queue:
             token = _hash([self.run_id, tid, ordinal, slot, generation])
             stop = now + row["budget_s"]
             admit_before = min(stop, now + self.lease_s)
+            deadline = self.deadline
             self._db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?,?,?,?,?,NULL,'reserved')",
                              (token, tid, split.value, ordinal, slot, generation, now,
                               admit_before, stop, admit_before))
             self._db.execute("UPDATE trials SET state='active' WHERE id=?", (tid,))
-            self._event(now, "reserved", tid, token, {"slot": slot, "generation": generation,
-                                                      "admit_before": admit_before, "hard_stop": stop})
+            detail = {"slot": slot, "generation": generation, "admit_before": admit_before, "hard_stop": stop}
+            if deadline != self.nominal_deadline:
+                detail["run_deadline"] = deadline
+            self._event(now, "reserved", tid, token, detail)
             return Admission(self.run_id, token, tid, row["manifest_sha"], split, ordinal, slot,
-                             generation, row["gpu_class"], now, admit_before, stop, self.deadline)
+                             generation, row["gpu_class"], now, admit_before, stop, deadline)
 
     def outstanding(self) -> list[Admission]:
         """Observation-only tickets: this API never authorizes sending/replaying admit."""
         with self._transaction():
-            rows = self._db.execute("SELECT a.*,t.manifest_sha,t.gpu_class FROM attempts a "
-                                    "JOIN trials t ON t.id=a.trial_id WHERE a.state!='closed' ORDER BY a.slot")
+            rows = self._db.execute("SELECT a.*,t.manifest_sha,t.gpu_class,e.detail AS reservation FROM attempts a "
+                                    "JOIN trials t ON t.id=a.trial_id JOIN events e ON e.token=a.token "
+                                    "AND e.kind='reserved' WHERE a.state!='closed' ORDER BY a.slot")
             return [self._as_ticket(r) for r in rows]
 
     def record(self, observation: Observation) -> None:
@@ -634,16 +793,19 @@ class Queue:
                 state = "queued"
             else:
                 state = "failed"
+            charged = _terminal_gpu_s(row["issued_at"], row["hard_stop"], o.outcome, o.at)
             self._db.execute("INSERT INTO receipts VALUES(?,?,?,?)", (o.token, _json(asdict(o)), now, accepted))
+            self._db.execute("UPDATE run_budget SET charged_s=charged_s+?", (charged,))
             self._db.execute("UPDATE attempts SET state='closed' WHERE token=?", (o.token,))
             self._db.execute("UPDATE trials SET state=?,result_sha=? WHERE id=?",
                              (state, o.result_sha if accepted else None, tid))
             self._event(now, "terminal", tid, o.token, {"outcome": o.outcome.value, "fence_sha": o.fence_sha,
-                                                       "result_sha": o.result_sha, "accepted": accepted, "state": state})
+                                                       "result_sha": o.result_sha, "accepted": accepted,
+                                                       "state": state, "charged_s": charged})
 
     def _poll(self, ticket: Admission, method: Callable[[Admission], Observation], *, admit: bool) -> None:
         with self._transaction() as now:
-            if now >= (ticket.admit_before if admit else self.deadline):
+            if now >= (ticket.admit_before if admit else ticket.run_deadline):
                 return
             if self._db.execute("SELECT state FROM attempts WHERE token=?", (ticket.token,)).fetchone()[0] == "closed":
                 return
@@ -658,8 +820,9 @@ class Queue:
     def tick(self, backend: Backend) -> dict:
         """One watchdog cycle: observe inflight tokens first, then admit at most two new ones."""
         with self._transaction() as now:
-            if now < self.deadline:
-                self._db.execute("UPDATE run SET watchdog_at=?", (now,))
+            if self._db.execute("SELECT closed FROM run").fetchone()[0]:
+                return self._status(now)
+            self._db.execute("UPDATE run SET watchdog_at=?", (now,))
         for ticket in self.outstanding():
             self._poll(ticket, backend.observe, admit=False)
         for _ in range(2):
@@ -676,9 +839,9 @@ class Queue:
         while True:
             status = self.tick(backend)
             now = status["as_of"]
-            if now >= self.deadline:
+            if status["phase"] == "closed":
                 return status
-            boundary = min(t for t in (self.freeze_at, self.finalize_at, self.deadline) if t > now)
+            boundary = min(status[k] for k in ("freeze_at", "finalize_at", "deadline") if status[k] > now)
             sleep(min(poll_s, boundary - now))
 
     def _status(self, now: int) -> dict:
@@ -687,6 +850,8 @@ class Queue:
             "FROM slots s LEFT JOIN attempts a ON a.slot=s.slot AND a.state!='closed' ORDER BY s.slot")
         return {"run_id": self.run_id, "start_utc": self.start_utc, "as_of": now, "phase": self._phase(now),
                 "freeze_at": self.freeze_at, "finalize_at": self.finalize_at, "deadline": self.deadline,
+                "nominal_deadline": self.nominal_deadline, "extension": self._extension(),
+                "gpu_budget": self._gpu_budget(),
                 "watchdog_at": self._db.execute("SELECT watchdog_at FROM run").fetchone()[0],
                 "slots": [dict(r) for r in slots],
                 "counts": [dict(r) for r in self._db.execute("SELECT * FROM status_counts ORDER BY split,state")],
@@ -723,9 +888,11 @@ class Queue:
                     blocked.append("gpu_class")
                 elif all(s["token"] is not None for s in slots):
                     blocked.append("slot_busy")
-                cutoff = self.freeze_at if item["split"] == Split.DEV else self.finalize_at
+                cutoff = status["freeze_at"] if item["split"] == Split.DEV else status["finalize_at"]
                 if item["budget_s"] > cutoff - status["as_of"]:
                     blocked.append("time_budget")
+                if item["budget_s"] > status["gpu_budget"]["remaining_s"]:
+                    blocked.append("gpu_budget")
             item["waiting_for"] = blocked
             rows.append(item)
         return rows

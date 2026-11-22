@@ -113,7 +113,7 @@ def run(args) -> None:
     if any(os.environ.get(k) != "1" for k in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")):
         raise ValueError("offline loader flags are required")
     obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
-    if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 24 * 3600:
+    if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 30 * 3600:
         raise ValueError("expired or unbounded worker deadline")
     # The coordinator binds a stricter absolute cutoff to this exact packet.
     # The OS alarm also covers initialization and time spent inside native code.

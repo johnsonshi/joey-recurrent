@@ -9,6 +9,8 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from joey_research.scheduler import (
     Admission, BackendUnavailable, ClockRegression, Gate, HOUR, Manifest, Observation,
@@ -265,6 +267,7 @@ class QueueTests(unittest.TestCase):
     def test_stale_pulses_cannot_renew_or_release_a_lease(self):
         self.add(manifest("pulse", budget=25))
         t = self.q.reserve()
+        spare = self.add(manifest("spare"), priority=200)
         self.clock.advance(7)
         pulse = Observation(t.token, Outcome.LIVE, self.clock())
         self.q.record(pulse)
@@ -281,21 +284,25 @@ class QueueTests(unittest.TestCase):
         self.clock.now = t.hard_stop + 1
         self.q.record(Observation(t.token, Outcome.LIVE, self.clock()))
         self.assertEqual(self.q.status()["slots"][0]["state"], "reconciling")
+        self.assertIsNone(self.q.reserve())  # Unfenced post-stop activity withholds all headroom.
         self.q.record(receipt(t, self.clock))
+        self.assertGreater(self.q.status()["gpu_budget"]["charged_s"], 25)
+        self.assertEqual(self.q.reserve().trial_id, spare)
         self.assertEqual(self.q.registry()[0]["state"], "expired")
         self.assertIsNone(self.q.registry()[0]["result_sha"])
 
-    def test_restart_uses_original_setup_origin_and_exact_budget_boundaries(self):
-        self.clock.now = START + 21 * HOUR - 30
+    def test_restart_uses_original_post_setup_origin_and_exact_budget_boundaries(self):
+        self.clock.now = START + 23 * HOUR - 30
         path = self.db.with_name("after-setup.sqlite")
-        q = Queue.create(path, run_id=RUN, start_utc=START, gpu_classes=("a", "a"), clock=self.clock)
+        q = Queue.create(path, run_id=RUN, start_utc=START, gpu_classes=("a", "a"),
+                         prior_gpu_s=15, clock=self.clock)
         try:
             for duration in (31, 30):
                 tid = q.register(manifest(str(duration), gpu="a", budget=duration), priority=100-duration)
                 for gate in Gate:
                     q.attest(tid, gate, digest(gate.value))
             t = q.reserve()
-            self.assertEqual(t.hard_stop, START + 21 * HOUR)
+            self.assertEqual(t.hard_stop, START + 23 * HOUR)
             self.assertEqual(t.trial_id, manifest("30", gpu="a", budget=30).key.trial_id)
             self.assertIsNone(q.reserve())
         finally:
@@ -304,12 +311,13 @@ class QueueTests(unittest.TestCase):
         q = Queue.resume(path, run_id=RUN, clock=self.clock)
         self.addCleanup(q.close)
         self.assertEqual(q.status()["phase"], "test")
+        self.assertEqual(q.status()["gpu_budget"]["remaining_s"], 48 * HOUR - 15 - 30)
         self.assertEqual(q.seal("freeze")["payload"]["picks"], [])
         q.record(receipt(t, self.clock))
         self.assertFalse(q.history(t.trial_id)[0]["accepted"])  # Cannot affect an already-frozen plan.
-        self.clock.now = START + 24 * HOUR
+        self.clock.now = START + 26 * HOUR
         self.assertEqual(q.status()["phase"], "closed")
-        self.assertEqual(q.seal("finalize")["effective_at"], START + 23 * HOUR)
+        self.assertEqual(q.seal("finalize")["effective_at"], START + 25 * HOUR)
         self.assertIsNone(q.reserve())
         with self.assertRaises(FileExistsError):
             Queue.create(path, run_id=RUN, start_utc=self.clock(), gpu_classes=("a", "a"), clock=self.clock)
@@ -456,10 +464,224 @@ class QueueTests(unittest.TestCase):
         self.addCleanup(q.close)
         backend = PhysicalDouble(self.clock)
         status = q.run(backend, poll_s=HOUR, sleep=self.clock.advance)
-        self.assertEqual((status["phase"], status["as_of"]), ("closed", START + 24 * HOUR))
+        self.assertEqual((status["phase"], status["as_of"]), ("closed", START + 26 * HOUR))
         self.assertEqual([(q.seal(k)["effective_at"], q.seal(k)["recorded_at"]) for k in ("freeze", "finalize")],
-                         [(START + 21 * HOUR,) * 2, (START + 23 * HOUR,) * 2])
+                         [(START + 23 * HOUR,) * 2, (START + 25 * HOUR,) * 2])
         self.assertEqual((backend.sent, backend.observed), ([], []))
+
+    def test_last_gpu_seconds_cannot_be_reserved_twice_or_regained_on_restart(self):
+        # Dev uses both slots for 23h. The 2h test window has room for 4 GPU-hours
+        # on the clock, but only 2 in the cumulative budget.
+        picks = []
+        for name, role, budget, priority in (("stock", Role.STOCK, 2 * HOUR, 0), ("pick", Role.SELECTED, 1, 1)):
+            dev = self.add(manifest(name, budget=23 * HOUR))
+            test = self.add(manifest(name, split=Split.TEST, budget=budget), priority=priority)
+            picks.append(Pick(dev, test, role))
+        devs = [self.q.reserve(), self.q.reserve()]
+        self.clock.now = self.q.freeze_at - 1
+        for ticket in devs:
+            self.q.record(receipt(ticket, self.clock))
+        self.q.nominate(picks, decision_sha=digest("dev evidence only"))
+        self.clock.advance(1)
+        barrier = threading.Barrier(2)
+
+        def contend(_):
+            q = Queue.resume(self.db, run_id=RUN, clock=self.clock)
+            try:
+                barrier.wait(timeout=10)
+                return q.reserve()
+            finally:
+                q.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ticket, = [t for t in pool.map(contend, range(2)) if t]
+        self.assertEqual(ticket.trial_id, picks[0].test_id)
+        self.assertEqual(ticket.hard_stop, self.q.finalize_at)  # Exact fit on both limits.
+        self.q.record(Observation(ticket.token, Outcome.UNKNOWN))
+        self.clock.advance(11)
+        self.restart()
+        snapshot = self.q.snapshot()
+        self.assertEqual(snapshot["status"]["gpu_budget"],
+                         {"cap_s": 48 * HOUR, "charged_s": 46 * HOUR, "reserved_s": 2 * HOUR, "remaining_s": 0})
+        waiting = next(t for t in snapshot["registry"] if t["id"] == picks[1].test_id)
+        self.assertEqual(waiting["waiting_for"], ["gpu_budget"])  # A physically free slot is not sufficient.
+        self.assertIsNone(self.q.reserve())
+        self.clock.now = self.q.finalize_at - 1
+        self.q.record(receipt(ticket, self.clock))
+        self.restart()
+        self.assertEqual(self.q.status()["gpu_budget"]["charged_s"], 48 * HOUR)
+        self.assertIsNone(self.q.reserve())  # The 1s pick still fits on the wall clock.
+        self.q.finish_early(reason_sha=digest("cap exhausted"))
+        skipped = next(r for r in self.q.seal("finalize")["payload"]["results"] if r["test_id"] == picks[1].test_id)
+        self.assertEqual((skipped["state"], skipped["receipt"]), ("expired", None))
+
+    def test_fenced_actual_time_replaces_full_reservation_exactly_once_across_retries(self):
+        self.add(manifest("retry", budget=60), max_attempts=2)
+        first = self.q.reserve()
+        self.clock.advance(9)
+        ended = receipt(first, self.clock, Outcome.RETRYABLE)
+        self.clock.advance(90)
+        self.q.record(Observation(first.token, Outcome.UNKNOWN))
+        self.restart()
+        self.assertEqual(self.q.status()["gpu_budget"]["reserved_s"], 60)  # Even past hard_stop.
+        self.q.record(ended)  # Actual terminal second, not the late poll.
+        self.restart()
+        self.q.record(ended)
+        second = self.q.reserve()
+        self.assertEqual(self.q.status()["gpu_budget"], {"cap_s": 172800, "charged_s": 10,
+                                                        "reserved_s": 60, "remaining_s": 172730})
+        self.clock.advance(7)
+        self.q.record(receipt(second, self.clock, Outcome.FENCED_ABSENT))
+        self.restart()
+        self.assertEqual(self.q.status()["gpu_budget"]["remaining_s"], 172790)
+        self.assertIsNone(self.q.reserve())  # Never-started consumed its attempt, not GPU time.
+
+    def test_early_freeze_and_finish_keep_real_times_and_all_feasible_picks(self):
+        pick = self.pair("early")
+        self.q.nominate([pick], decision_sha=digest("dev decision"))
+        peer = Queue.resume(self.db, run_id=RUN, clock=self.clock)
+        self.addCleanup(peer.close)
+        self.add(manifest("other dev"))
+        active = self.q.reserve()
+        self.q.record(Observation(active.token, Outcome.UNKNOWN))
+        reason = digest("dev stopping rule")
+        with self.assertRaises(PolicyError):
+            peer.freeze_early(reason_sha=reason)
+        self.q.record(receipt(active, self.clock, Outcome.FENCED_ABSENT))
+        with self.assertRaises(PolicyError):
+            peer.finish_early(reason_sha=reason)
+        self.assertIsNone(self.q.seal("freeze"))  # The rejected close was atomic.
+        self.clock.advance(32)
+        peer.freeze_early(reason_sha=reason)
+        freeze = self.q.seal("freeze")
+        self.assertEqual((freeze["effective_at"], freeze["recorded_at"], freeze["payload"]["reason_sha"]),
+                         (self.clock(), self.clock(), reason))
+        self.assertEqual(self.q.finalize_at, self.clock() + 2 * HOUR)
+        with self.assertRaises(PolicyError):
+            self.q.nominate([], decision_sha=digest("change after freeze"))
+        with self.assertRaises(PolicyError):
+            self.q.extend_once(hours=1, evidence_sha=reason)
+        t = self.q.reserve()
+        self.assertEqual(t.trial_id, pick.test_id)
+        with self.assertRaises(PolicyError):
+            peer.finish_early(reason_sha=reason)
+        self.clock.advance(5)
+        evidence = receipt(t, self.clock)
+        self.q.record(evidence)
+        self.restart()
+        status = self.q.finish_early(reason_sha=digest("work complete"))
+        final = peer.seal("finalize")
+        self.assertEqual((status["phase"], final["recorded_at"], final["effective_at"]),
+                         ("closed", self.clock(), self.clock()))
+        self.assertEqual(final["payload"]["results"][0]["result_sha"], evidence.result_sha)
+        self.assertEqual(peer.run(PhysicalDouble(self.clock), sleep=self.fail)["as_of"], self.clock())
+        self.clock.now = START + 30 * HOUR  # CPU verification/reporting overrun, no additional GPU work.
+        self.restart()
+        self.assertEqual(self.q.snapshot()["status"]["event_seq"], status["event_seq"])
+        self.assertIsNone(self.q.reserve())
+        self.assertEqual((self.q.seal("freeze"), self.q.seal("finalize")), (freeze, final))
+
+    def test_v1_resume_accounts_for_existing_evidence_without_extending_old_cutoffs(self):
+        self.add(manifest("settled"))
+        closed = self.q.reserve()
+        self.clock.advance(6)
+        self.q.record(receipt(closed, self.clock, Outcome.FAILED))
+        self.add(manifest("unknown", budget=80))
+        outstanding = self.q.reserve()
+        self.q.close()
+        # A v1 DB has the same durable tickets/receipts, but no run_budget table.
+        with sqlite3.connect(self.db) as db:
+            db.execute("DROP TABLE run_budget")
+            db.execute("PRAGMA user_version=1")
+        self.clock.now = START
+        with self.assertRaises(ClockRegression):
+            Queue.resume(self.db, run_id=RUN, clock=self.clock)
+        with sqlite3.connect(self.db) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)  # Entire upgrade rolled back.
+        self.clock.now = START + 22 * HOUR
+        self.q = Queue.resume(self.db, run_id=RUN, clock=self.clock)
+        status = self.q.status()
+        self.assertEqual((status["phase"], self.q.freeze_at, self.q.finalize_at, self.q.deadline),
+                         ("test", START + 21 * HOUR, START + 23 * HOUR, START + 24 * HOUR))
+        self.assertEqual((status["gpu_budget"]["charged_s"], status["gpu_budget"]["reserved_s"]), (7, 80))
+        self.assertEqual(self.q.outstanding(), [replace(outstanding, run_deadline=START + 24 * HOUR)])
+        self.restart()
+        self.assertEqual(self.q.status(), status)
+
+    def test_explicit_extension_shifts_new_work_only_and_survives_restart(self):
+        self.add(manifest("long", budget=27 * HOUR), priority=0)
+        self.add(manifest("short"))
+        old = self.q.reserve()
+        self.assertIsNone(self.q.reserve())  # The long envelope needs an explicit extension.
+        budget = self.q.status()["gpu_budget"]
+        peer = Queue.resume(self.db, run_id=RUN, clock=self.clock)
+        self.addCleanup(peer.close)
+        evidence = digest("approved dev-only timing decision")
+        status = peer.extend_once(hours=4, evidence_sha=evidence)
+        self.assertEqual((status["start_utc"], status["nominal_deadline"], status["gpu_budget"]),
+                         (START, START + 26 * HOUR, budget))
+        extension = {"hours": 4, "evidence_sha": evidence, "recorded_at": START, "freeze_at": START + 27 * HOUR,
+                     "finalize_at": START + 29 * HOUR, "deadline": START + 30 * HOUR}
+        self.assertEqual(status["extension"], extension)
+        new = self.q.reserve()  # Same UTC second, different ticket deadlines.
+        self.assertEqual((new.hard_stop, new.run_deadline), (extension["freeze_at"], extension["deadline"]))
+        self.restart()
+        self.assertEqual(self.q.outstanding(), [old, new])
+        self.q.extend_once(hours=4, evidence_sha=evidence)  # Idempotent, not +4h again.
+        for hours, proof in ((1, evidence), (4, digest("replacement evidence"))):
+            with self.assertRaises(PolicyError):
+                peer.extend_once(hours=hours, evidence_sha=proof)
+        events = [e for e in peer.events() if e["kind"] == "timing_extended"]
+        self.assertEqual([{**e["detail"], "recorded_at": e["utc"]} for e in events], [extension])
+        self.clock.now = old.run_deadline
+        backend = PhysicalDouble(self.clock)
+        self.assertEqual(self.q.tick(backend)["phase"], "search")  # At the nominal wall target.
+        self.assertEqual(backend.observed, [new.token])  # No extended RPC authority for the old token.
+        self.clock.now = extension["freeze_at"]
+        self.assertEqual(self.q.status()["phase"], "test")
+        self.clock.now = extension["finalize_at"]
+        self.assertEqual(self.q.status()["phase"], "finalize")
+        self.assertIsNone(self.q.reserve())
+        self.clock.now = extension["deadline"] + HOUR
+        self.restart()
+        self.assertEqual(self.q.status()["phase"], "closed")
+        self.assertEqual((self.q.seal("freeze")["effective_at"], self.q.seal("finalize")["effective_at"]),
+                         (extension["freeze_at"], extension["finalize_at"]))
+
+    def test_invalid_or_boundary_extension_cannot_reopen_or_buy_time(self):
+        proof = digest("justification")
+        self.clock.now = self.q.freeze_at - 1
+        for hours, evidence in ((0, proof), (5, proof), (True, proof), (1.5, proof), (1, "unbound")):
+            with self.assertRaises(PolicyError):
+                self.q.extend_once(hours=hours, evidence_sha=evidence)
+        self.clock.advance(1)
+        with self.assertRaises(PolicyError):
+            self.q.extend_once(hours=1, evidence_sha=proof)
+        self.restart()
+        status = self.q.status()
+        self.assertIsNone(status["extension"])
+        self.assertEqual((status["phase"], status["deadline"]), ("test", START + 26 * HOUR))
+        self.assertEqual(self.q.seal("freeze")["effective_at"], self.clock())
+
+    def test_worker_outer_deadline_guard_remains_bounded(self):
+        from joey_research import worker
+
+        args = SimpleNamespace(packet=None, packet_sha256=None)
+        obj = {"schema": 1, "split": "discovery", "inputs_sha256": digest("input"), "window": [4, 8],
+               "loop": {"k": 1}, "reverse": False}
+        flags = {k: "1" for k in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE")}
+        with (patch.dict(worker.os.environ, flags), patch.object(worker.time, "time", return_value=START),
+              patch.object(worker, "_load") as load, patch.object(worker.signal, "signal"),
+              patch.object(worker.signal, "setitimer", side_effect=StopIteration) as timer):
+            for remaining in (0, 30 * HOUR + 1):
+                load.return_value = json.dumps({**obj, "deadline_utc": START + remaining}).encode()
+                with self.assertRaisesRegex(ValueError, "deadline"):
+                    worker.run(args)
+            timer.assert_not_called()
+            load.return_value = json.dumps({**obj, "deadline_utc": START + 30 * HOUR}).encode()
+            with self.assertRaises(StopIteration):  # Stop before even reading rows; no real alarm or device.
+                worker.run(args)
+            timer.assert_called_once_with(worker.signal.ITIMER_REAL, 30 * HOUR)
 
     def test_rejects_mismatched_observations_and_immutable_database_writes(self):
         self.add(manifest("response"))
@@ -476,7 +698,8 @@ class QueueTests(unittest.TestCase):
         self.clock.now = self.q.freeze_at
         self.q.seal("freeze")
         with sqlite3.connect(self.db) as raw:
-            for statement in ("UPDATE receipts SET accepted=0", "DELETE FROM seals", "DELETE FROM events"):
+            for statement in ("UPDATE receipts SET accepted=0", "DELETE FROM seals", "DELETE FROM events",
+                              "UPDATE run_budget SET cap_s=cap_s+3600", "UPDATE run_budget SET charged_s=0"):
                 with self.assertRaises(sqlite3.IntegrityError):
                     raw.execute(statement)
             self.assertEqual(raw.execute("PRAGMA integrity_check").fetchone()[0], "ok")
