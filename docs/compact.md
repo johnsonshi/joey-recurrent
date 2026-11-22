@@ -36,6 +36,8 @@ The pinned text stack has 24 layers: six `[linear, linear, linear, full]` cycles
 
 Both yield 16 calls at `k=1` and 24 at `k=2`. Only `text_config.num_hidden_layers` and `text_config.layer_types` change. Unselected `model.language_model.layers.*` records are physically absent rather than ignored at runtime.
 
+The three 20-layer recipes vary the representative for middle cycles 2 and 3. `select-20.json` keeps the earlier cycle. `select-20-late.json` keeps the later cycle. `merge-20-mid.json` keeps the earlier anchor but uses the midpoint of the corresponding MLP projections. All three repeat physical layers `[8,12)`, giving 20 layer visits at one pass and 24 at two passes. Each needs a native one-pass control on its own exported bytes.
+
 Merging applies **only** to the same phase's dense `mlp.{gate,up,down}_proj.weight`. Each coefficient must be positive; coefficients sum to one. Products and additions round separately to FP32 in source order. The result is cast once to the anchor dtype (round-to-nearest-even, including BF16). All attention projections, gated-delta state parameters (`A_log`, `dt_bias`), convolution, gates inside attention, norms, heads, embeddings and vision are **never averaged**. The selected anchor supplies every excluded layer tensor. The merge loop is a bounded-memory scalar reference, not a fast multi-billion-element kernel; use selection for a copy-only first run.
 
 ## Storage contract and measurements
@@ -56,6 +58,16 @@ footprint = measure_text_storage(resident)
 ```
 
 This counts shared byte ranges once and includes a real FP32 head clone when supplied. It reports unique referenced elements/bytes and reachable backing-storage bytes. Supply resident contiguous tensors, not meta/sharded placeholders; mixed-dtype views of one storage are unsupported. The result excludes activations, caches, allocator reserve and other tensors not passed in. Measure peak device allocation and latency separately.
+
+## Weight-only residual diagnostic
+
+On a POSIX host with NumPy already available, measure the same 12 gate/up/down projection pairs without running Joey. Supply the absolute path to the read-only original safetensors file and a **fresh** absolute output filename in an existing owner-only directory outside version control:
+
+```sh
+python -B scripts/compact_spectrum.py --weights "$READ_ONLY_WEIGHTS" --output "$PRIVATE_REPORT"
+```
+
+The diagnostic checks the full source digest and compares only corresponding positions of the same attention family. For matrices `A` and `B`, it measures reconstruction from the shared midpoint and one sign-shared factorization of `(B-A)/2`. It scores ranks 1, 4, 16 and 64 by directly measuring residual error, including after rounding the factors to BF16. The result is **achieved** energy for a seeded sketch, not an optimal-SVD bound. The JSON contains scalar measurements, algorithm settings and local resource measurements; no factors or weights are written. A lower reconstruction error or a smaller logical factor payload does not establish better task accuracy or lower GPU memory use.
 
 ## Evidence and limits
 
