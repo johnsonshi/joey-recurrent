@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "dataset": {"family": "synthetic-permuted-routes", "seed": 73919, "groups_per_depth": 100, "width": 4, "depths": [2, 3, 4]},
+  "screening_groups_per_depth": 12,
+  "initial_workers": ["loop", "compact"],
+  "inference_precision": "bf16",
+  "confident_error_thresholds": [0.8, 0.9, 0.95, 0.99],
+  "frozen_evaluation": {
+    "primary": "macro.accuracy",
+    "paired_bootstrap_groups": true,
+    "accuracy_noninferiority_margin": 0.02,
+    "brier_noninferiority_margin": 0.01,
+    "max_finalists_per_branch_excluding_controls": 2
+  },
+  "loop_windows": [[4, 8], [8, 12], [12, 16], [8, 16]],
+  "loop_controls": [{"k": 1, "method": "naive"}, {"k": 2, "method": "zero_extra"}, {"k": 2, "method": "naive"}],
+  "loop_screen": [
+    {"k": 2, "method": "damped_extra", "alpha": 0.25},
+    {"k": 3, "method": "damped_extra", "alpha": 0.1},
+    {"k": 3, "method": "rk", "beta": 0.5},
+    {"k": 3, "method": "euler"}
+  ],
+  "compact_plans": ["select-20", "select-16", "merge-16"],
+  "compact_passes": [1, 2]
+}

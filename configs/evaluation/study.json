@@ -1,0 +1,8 @@
+{
+  "schema": "joey-decision-v1",
+  "split_seed": 8201,
+  "group_weights": {"discovery": 45, "selection": 20, "calibration": 15, "final": 20},
+  "threshold": 0.8,
+  "bootstrap_reps": 2000,
+  "bootstrap_seed": 4117
+}
