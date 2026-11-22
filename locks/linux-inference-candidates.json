@@ -76,13 +76,13 @@
       "version": "0.8.2"
     },
     {
-      "bytes": 244553,
-      "filename": "filelock-4.3.0-py3-none-any.whl",
+      "bytes": 218040,
+      "filename": "filelock-4.2.10-py3-none-any.whl",
       "package": "filelock",
       "reported_license": "MIT",
-      "sha256": "f933f39f7e01249a4a49b9abab30edc6d4b874624c3de5dd0b0d137aa8adb979",
-      "source": "https://pypi.org/project/filelock/4.3.0/",
-      "version": "4.3.0"
+      "sha256": "9479aaeb4db20b5a53e3da28493edd24720b66b8a0b84030aa56ccdf243d6857",
+      "source": "https://pypi.org/project/filelock/4.2.10/",
+      "version": "4.2.10"
     },
     {
       "bytes": 819225,
@@ -269,13 +269,13 @@
       "version": "2.21.0"
     },
     {
-      "bytes": 828016,
-      "filename": "pyyaml-6.0.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+      "bytes": 806638,
+      "filename": "pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
       "package": "pyyaml",
       "reported_license": "MIT License",
-      "sha256": "622aa875fa6533f25fedcffe23079357d65a690d462200afed5d8e9d0e01ebee",
-      "source": "https://pypi.org/project/pyyaml/6.0.4/",
-      "version": "6.0.4"
+      "sha256": "b8bb0864c5a28024fac8a632c443c87c5aa6f215c0b126c449ae1a150412f31d",
+      "source": "https://pypi.org/project/pyyaml/6.0.3/",
+      "version": "6.0.3"
     },
     {
       "bytes": 804978,

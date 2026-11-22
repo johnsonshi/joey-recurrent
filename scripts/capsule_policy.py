@@ -16,7 +16,7 @@ STAGING = "src/joey_research/staging.py"
 PINS = {
     "locks/model.json": "97cf276fc13f69836cc3841118b1a20fe4f5cce4a76794710072812e03a0af23",
     "locks/worker-base.json": "c6997f731f79768ec0137e02633108bf93398ad301aa621e26de72dbb269b620",
-    WHEEL_LOCK: "503b666e08a919fefcd01fb98e23a3916200c3d4f1cba4cf148726c4247e3eea",
+    WHEEL_LOCK: "540f264103c07f093d7c10571262bef935548c52a80506ca7c6c1d9aebcafc81",
     NATIVE: "1e700279aaa709c3a6084cf10316c6e84099639db6e0f753c68cfc2d89fd5e1c",
     STAGING: "76dd7f4b319ff9fa5ff10a814bee299c885efbe15064573f6d7611c67ee7b314",
 }

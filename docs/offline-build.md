@@ -11,7 +11,7 @@ These are separate coordinator gates. `prepare_capsule.py` performs none of them
        receipt_sha256=approved_receipt_sha256,
        discovery_sha256=approved_study_discovery_sha256,
        wheel_lock_bytes=trusted_linux_wheel_lock_bytes,
-       wheel_lock_sha256="503b666e08a919fefcd01fb98e23a3916200c3d4f1cba4cf148726c4247e3eea",
+       wheel_lock_sha256="540f264103c07f093d7c10571262bef935548c52a80506ca7c6c1d9aebcafc81",
    )
    ```
 
