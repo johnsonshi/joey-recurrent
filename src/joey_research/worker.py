@@ -22,11 +22,13 @@ from .loop_analysis import Policy, SlotOrder, Stop, actuate
 TRANSFER_MODE = "typed-transfer"
 PROBE_MODE = "one-probe"
 HORIZON_MODE = "routing-horizon"
+EDIT_MODE = "routing-edits"
 PHASES = {"public-development": "banking77-public-train-research-77/v1",
           "public-native": "banking77-original-train-native77/v1",
           TRANSFER_MODE: "joey-native-inventory-development/v1",
           PROBE_MODE: "joey-fresh-single-probe-routing/v1",
           HORIZON_MODE: "joey-constant-evidence-routing/v1",
+          EDIT_MODE: "joey-matched-route-edits/v1",
           "refinement": "joey-discovery-remainder/v1",
           "calibration": "joey-calibration-research/v1", "final": "joey-final-research/v1"}
 REFINEMENT_RECIPES = ("select-20-late", "merge-20-mid")
@@ -34,6 +36,7 @@ NATIVE_OPTIONS = tuple(f"option_{i}" for i in range(77))
 SELECT20_LAYERS = (*range(12), *range(16, 24))
 TRANSFER_LOOPS = ((1, "naive"), (2, "naive"), (4, "naive"), (6, "naive"), (2, "zero_extra"))
 HORIZON_LOOPS = (*TRANSFER_LOOPS, (8, "naive"))
+EDIT_LOOPS = ((1, "naive"), (2, "zero_extra"), (2, "naive"), (4, "naive"))
 _LEVELS = ("Empty (0 units)", "Low (1 to 3 units)", "Medium (4 to 6 units)", "High (7 or more units)")
 _TRANSFER_TASKS = {
     "stock-eligibility": ("noul", ("yes", "no"), "After posted entries only, does the focus depot have at least five units?"),
@@ -43,6 +46,17 @@ _TRANSFER_TASKS = {
                      "After posted entries only, which depot has the most units? "
                      "If there is no unique maximum, choose No unique depot."),
 }
+
+
+@dataclass(frozen=True)
+class _FixedRoute:
+    task: str
+    loops: tuple[tuple[int, str], ...]
+
+
+_FIXED_ROUTES = {HORIZON_MODE: _FixedRoute("fixed_evidence_route", HORIZON_LOOPS),
+                 EDIT_MODE: _FixedRoute("parcel_entry_route", EDIT_LOOPS)}
+_SEALED_STREAM_MODES = (TRANSFER_MODE, PROBE_MODE, *_FIXED_ROUTES)
 
 
 def compact_recipe(name: str) -> dict:
@@ -65,18 +79,32 @@ def compact_recipe(name: str) -> dict:
     return {"format":"joey-compact/v1","groups":groups,"repeat_cycles":repeat}
 
 
-def choice_request(row: dict, order: tuple[int, ...]) -> tuple[str, dict]:
-    input_sha256(row)  # Validate the label-free projection.
+def _checked_input_sha256(row, split):
+    digest = input_sha256(row)
+    route = _FIXED_ROUTES.get(split)
+    if route is not None:
+        if (row["task"] != route.task or len(row["choices"]) != 4
+                or not all(re.fullmatch(r"Enter at [A-Z]{3}", c) for c in row["choices"])):
+            raise ValueError("fixed routing requires its own task and four-entry menu")
+    elif row["task"] == _FIXED_ROUTES[EDIT_MODE].task:
+        raise ValueError("edited routing input requires its own phase")
+    return digest
+
+
+def choice_request(row: dict, order: tuple[int, ...], *, split="discovery") -> tuple[str, dict]:
+    _checked_input_sha256(row, split)
     choices = row["choices"]
     if len(choices) > 255 or sorted(order) != list(range(len(choices))):
         raise ValueError("unsupported choice count or ordering")
     criteria = {f"opt_{i}": choices[i] for i in order}
+    if split in _FIXED_ROUTES and tuple(criteria) != ("opt_0", "opt_1", "opt_2", "opt_3"):
+        raise ValueError("fixed routing requires forward slots")
     return row["prompt"], {"decision": {"type": "choice", "instructions": "Select the best option.", "criteria": criteria}}
 
 
 def public_native_payload(row):
     """Reconstruct only the q1 payload whose equivalence was checked at admission."""
-    input_sha256(row)
+    _checked_input_sha256(row, "public-native")
     criteria = dict(zip(NATIVE_OPTIONS, row["choices"], strict=True))
     return {"state": {}, "questions": {"q1": {"type": "choice", "instructions": row["prompt"], "criteria": criteria}}}
 
@@ -164,16 +192,20 @@ def _transfer_arm(window, plan, compact):
     return compact, plan.k, plan.method
 
 
-def _horizon_arm(settings):
+def _fixed_route_arm(settings, mode):
     compact = "compact_recipe" in settings
     keys = {"window", "loop", "reverse"} | ({"compact_recipe", "compact_manifest_sha256"} if compact else set())
     loop = settings["loop"]
     if (set(settings) != keys or settings["window"] != [8, 12] or settings["reverse"] is not False
             or type(loop) is not dict or set(loop) != {"k", "method"} or type(loop["k"]) is not int
-            or (loop["k"], loop["method"]) not in HORIZON_LOOPS
+            or (loop["k"], loop["method"]) not in _FIXED_ROUTES[mode].loops
             or (compact and settings["compact_recipe"] != "select-20")):
-        raise ValueError("outside the fixed-evidence routing comparison")
+        raise ValueError(f"outside the fixed {mode} comparison")
     return compact, loop["k"], loop["method"]
+
+
+def _horizon_arm(settings):
+    return _fixed_route_arm(settings, HORIZON_MODE)
 
 
 def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *, reverse=False,
@@ -205,12 +237,12 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
         # Noul criteria keys and score descriptions are not the native slot labels.
         labels = _TRANSFER_TASKS[row["task"]][1]
     else:
-        if split == HORIZON_MODE and (reverse or policy is not None or plan.readout != "final"
-                or tuple(window) != (8, 12) or (plan.k, plan.method) not in HORIZON_LOOPS
-                or row["task"] != "fixed_evidence_route" or len(order) != 4
+        route = _FIXED_ROUTES.get(split)
+        if route is not None and (reverse is not False or policy is not None or plan.readout != "final"
+                or tuple(window) != (8, 12) or (plan.k, plan.method) not in route.loops
                 or hasattr(native, "physical_to_source") and tuple(native.physical_to_source) != SELECT20_LAYERS):
-            raise ValueError("nonfixed depth, payload or input in horizon comparison")
-        state, questions = choice_request(row, order)
+            raise ValueError("nonfixed method or payload in fixed routing comparison")
+        state, questions = choice_request(row, order, split=split)
         qid = "decision"
         labels = tuple(questions[qid]["criteria"])
     branch = native.branches(state, questions, window=window)[qid]
@@ -218,7 +250,8 @@ def measure_choice(native, row: dict, window: tuple[int, int], plan: LoopPlan, *
         raise ValueError("native option order differs from the request")
 
     def original_order(p):
-        if len(p) != len(order) or any(not math.isfinite(v) or not 0 <= v <= 1 for v in p) or abs(math.fsum(p)-1) > 1e-6:
+        if (len(p) != len(order) or (split in _FIXED_ROUTES and any(type(v) not in (int, float) for v in p))
+                or any(not math.isfinite(v) or not 0 <= v <= 1 for v in p) or abs(math.fsum(p)-1) > 1e-6):
             raise ValueError("invalid native distribution")
         return [v for _, v in sorted(zip(order, p, strict=True))]
     lo, hi = window
@@ -273,6 +306,20 @@ def _load(path: Path, digest: str) -> bytes:
     return data
 
 
+def _is_gated_shard(path, gated):
+    if path is None:
+        return False
+    if path in gated or path.resolve() in gated:
+        return True
+    # Discovery accepts arbitrary paths. A hard link can name the same
+    # staged file without resolving to its path; compare identities, not bytes.
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    return st.st_nlink > 1 and any(p.is_file() and os.path.samestat(st, p.stat()) for p in gated)
+
+
 def _policy(obj):
     if not isinstance(obj,dict) or set(obj)-{"pool","stop","fallback","first_weight"}:
         raise ValueError("invalid discovery policy")
@@ -286,6 +333,7 @@ def _policy(obj):
 
 _ENVELOPE = {"schema", "split", "inputs_sha256", "deadline_utc"}
 _SELECTION_ENVELOPE = _ENVELOPE | {"permit_sha256", "method_sha256"}
+_PHASE_ENVELOPE = _SELECTION_ENVELOPE | {"view_sha256"}
 _REQUIRED_SETTINGS = {"window", "loop", "reverse"}
 _SETTINGS = _REQUIRED_SETTINGS | {"policy", "compact_recipe", "compact_manifest_sha256", "order_ensemble", "probe_margin"}
 PERMIT_LIMIT = 128 * 1024
@@ -421,12 +469,12 @@ def _nominated(obj, methods, envelope):
             if arm in arms or len(compact_pins)>1:raise ValueError("duplicate probe arm or different compact payloads")
             arms.add(arm)
         elif "probe_margin" in settings:raise ValueError("first-margin method outside its independent phase")
-        if obj["split"] == HORIZON_MODE:
-            arm = _horizon_arm(settings)
+        if obj["split"] in _FIXED_ROUTES:
+            arm = _fixed_route_arm(settings, obj["split"])
             if arm[0]:
                 compact_pins.add(settings["compact_manifest_sha256"])
             if arm in arms or len(compact_pins) > 1:
-                raise ValueError("duplicate horizon arm or inconsistent physical payload")
+                raise ValueError("duplicate routing arm or inconsistent physical payload")
             arms.add(arm)
         if obj["split"] in ("public-native", TRANSFER_MODE):
             window, plan = _settings(settings)
@@ -525,14 +573,13 @@ def phase_packet(raw, permit_bytes, gate: PhaseGate):
             or type(view["rows"]) is not int or not 0 < view["rows"] <= (512 if gate.mode == "public-native" else 20000)
             or type(view["bytes"]) is not int or not 0 < view["bytes"] <= 64 * 2**20):
         raise ValueError("invalid phase view")
-    envelope = _SELECTION_ENVELOPE | {"view_sha256"}
-    if (type(obj) is not dict or not envelope <= obj.keys() or type(obj["schema"]) is not int or obj["schema"] != 1
+    if (type(obj) is not dict or not _PHASE_ENVELOPE <= obj.keys() or type(obj["schema"]) is not int or obj["schema"] != 1
             or obj["split"] != gate.mode or obj["view_sha256"] != gate.view_sha256
             or obj["inputs_sha256"] != view["inputs_sha256"] or obj["permit_sha256"] != gate.permit_sha256
             or not _pin(obj["method_sha256"]) or type(obj["deadline_utc"]) is not int
             or obj["deadline_utc"] != gate.hard_stop):
         raise ValueError("phase packet differs from frozen view")
-    return (*_nominated(obj, permit["methods"], envelope), view)
+    return (*_nominated(obj, permit["methods"], _PHASE_ENVELOPE), view)
 
 
 def _upstream_line(obj):
@@ -569,12 +616,9 @@ def phase_rows(raw, view):
         elif view["split"] == TRANSFER_MODE:
             typed_transfer_payload(row)
         else:
-            input_sha256(row)
+            _checked_input_sha256(row, view["split"])
             if view["split"]==PROBE_MODE and (len(row["choices"])!=4 or row["task"] not in ("routing_2hop","routing_3hop","routing_4hop")):
                 raise ValueError("single-probe view needs four-way routed decisions")
-            if view["split"] == HORIZON_MODE and (row["task"] != "fixed_evidence_route" or len(row["choices"]) != 4
-                    or not all(re.fullmatch(r"Enter at [A-Z]{3}", c) for c in row["choices"])):
-                raise ValueError("fixed-horizon view requires its own four-entry menu")
         if len(rows) >= view["rows"] or row["id"] in seen or len(row["choices"]) > 255:
             raise ValueError("phase row inventory differs")
         if view["split"] in ("public-development", "public-native") and (
@@ -591,8 +635,8 @@ def phase_rows(raw, view):
 
 
 def _measure_ensemble(native, row, window, plan, split, *, second):
-    if split == TRANSFER_MODE:
-        raise ValueError("no order ensemble in typed-transfer")
+    if split == TRANSFER_MODE or split in _FIXED_ROUTES:
+        raise ValueError(f"no order ensemble in {split}")
     pred, trace = measure_choice(native, row, window, plan, split=split)
     if second:
         rev, other = measure_choice(native, row, window, plan, split=split, reverse=True)
@@ -618,7 +662,7 @@ def run(args) -> None:
         if (selection or nomination_pin is not None or phase not in PHASES
                 or args.packet != transport.ADMISSION / "packet.json" or args.model_dir != transport.STAGED / "model"
                 or args.inputs != transport.STAGED / "inputs" / (phase + ".jsonl")
-                or (phase in (PROBE_MODE,TRANSFER_MODE,HORIZON_MODE) and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
+                or (phase in _SEALED_STREAM_MODES and (args.output != transport.WORK / "run/out" or args.compact_dir is not None))
                 or args.compact_dir not in (None, transport.STAGED / "compact")):
             raise ValueError("wrong phase launch")
         gate = PhaseGate(phase, args.admit_before, args.hard_stop, args.packet_sha256, args.phase_permit_sha256,
@@ -636,8 +680,9 @@ def run(args) -> None:
     else:
         if nomination_pin is not None:
             raise ValueError("discovery cannot consume a nomination")
-        if getattr(args, "inputs", None) in (transport.STAGED / "inputs" / (n + ".jsonl") for n in (TRANSFER_MODE,PROBE_MODE,HORIZON_MODE)):
-            raise ValueError("transfer or probe shard requires its phase gate")
+        gated = {transport.STAGED / "inputs" / (n + ".jsonl") for n in _SEALED_STREAM_MODES}
+        if any(_is_gated_shard(path, gated) for path in (args.packet, getattr(args, "inputs", None))):
+            raise ValueError("staged shard requires its phase gate")
         obj, window, plan = _packet(_load(args.packet, args.packet_sha256))
     if type(obj["deadline_utc"]) is not int or not 0 < obj["deadline_utc"] - time.time() <= 30 * 3600:
         raise ValueError("expired or unbounded worker deadline")
@@ -660,7 +705,7 @@ def run(args) -> None:
         raise ValueError("invalid tier or duplicate decision IDs")
     if phase not in ("public-native", TRANSFER_MODE):  # phase_rows already checked every native request.
         for row in rows:
-            choice_request(row, tuple(range(len(row["choices"]))))
+            choice_request(row, tuple(range(len(row["choices"]))), split=obj["split"])
     ensemble = obj.get("order_ensemble")
     split = obj["split"]
     if ensemble is not None:

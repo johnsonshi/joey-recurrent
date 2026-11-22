@@ -80,7 +80,7 @@ class TransportTest(unittest.TestCase):
         a = self.discovery()
         if settings is None:
             settings = {"window": [8, 12], "loop": {"k": 1}, "reverse": False}
-            if mode in ("one-probe","routing-horizon"):settings["loop"]["method"]="naive"
+            if mode in ("one-probe","routing-horizon","routing-edits"):settings["loop"]["method"]="naive"
         mid = worker.method_sha256(settings)
         public = mode in ("public-development", "public-native")
         if choices is None:
@@ -89,13 +89,14 @@ class TransportTest(unittest.TestCase):
                 choices = ["Yes", "No"]
             if mode == "one-probe":
                 choices = ["North","South","East","West"]
-            if mode == "routing-horizon":
+            if mode in ("routing-horizon","routing-edits"):
                 choices = ["Enter at "+s for s in ("AAA","BBB","CCC","DDD")]
         row = dict(self.row, id="toy-" + mode, prompt="Invented café case?", choices=choices)
         if mode == "typed-transfer":
             row.update(task="stock-eligibility", prompt="Focus: Fern. Fern opens with 2 units; +4 posted, +1 pending.")
         if mode=="one-probe":row["task"]="routing_2hop"
         if mode=="routing-horizon":row["task"]="fixed_evidence_route"
+        if mode=="routing-edits":row["task"]="parcel_entry_route"
         records = [row] if rows is None else rows
         shard = b"".join(tr._encoded(r) + b"\n" for r in records)
         if mode == "public-native":
@@ -824,7 +825,7 @@ class TransportTest(unittest.TestCase):
                     a = self.phase_attempt(mode)
                     status, files = tr._result(a)
                     self.assertEqual(status, "complete")
-                    self.assertEqual(observations.pop(), 77 if mode in ("public-development", "public-native") else 4 if mode in ("one-probe","routing-horizon") else 2)
+                    self.assertEqual(observations.pop(), 77 if mode in ("public-development", "public-native") else 4 if mode in ("one-probe","routing-horizon","routing-edits") else 2)
                     self.assertFalse(observations)  # No extra real-row warmup.
                     if mode == "public-native":
                         trace = json.loads(files["trace.jsonl"])
