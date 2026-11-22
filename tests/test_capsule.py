@@ -18,7 +18,7 @@ import capsule_io as disk
 import capsule_net as web
 import capsule_build as build
 import prepare_capsule as cli
-from capsule_patch import patched
+from capsule_patch import new_files, patched
 from capsule_policy import PINS, WHEEL_LOCK, Policy, metadata_url, review_refs, wheel_url
 
 
@@ -432,6 +432,15 @@ class Assembly(unittest.TestCase):
             with self.assertRaises(disk.Refused), net.get(p.hf("setup.sh")):
                 self.fail("requested a non-allowlisted source")
             connect.assert_not_called()
+
+    def test_publisher_addition_has_no_upstream_preimage(self):
+        diff = (b"diff --git a/qev/readout.py b/qev/readout.py\nnew file mode 100644\n"
+                b"index 0000000..0123abc\n@@ -0,0 +1,2 @@\n+# data fixture\n+VALUE = 3\n")
+        added, normalized = new_files(diff, {"qev/readout.py"})
+        self.assertEqual(added, {"qev/readout.py"})
+        self.assertEqual(patched({}, normalized, added), {"qev/readout.py": b"# data fixture\nVALUE = 3\n"})
+        with self.assertRaises(disk.Refused):
+            patched({"qev/readout.py": b"existing"}, normalized, added)
 
     def test_patch_checks_context_offsets_and_scoped_paths(self):
         orig = {"qev/engine.py": b"first\nold\nlast"}

@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 from capsule_io import (Refused, atomic, canonical, directory, document, download, existing, is_sha,
                         regular, require, sha, small_file, sync_dir, trusted_surface, verify_file)
 from capsule_net import FLA_LICENSE, HF, ONE, fetch
-from capsule_patch import patched
+from capsule_patch import new_files, patched
 from capsule_policy import NATIVE, PINS, STAGING, WHEEL_LOCK, metadata_url, wheel_url
 
 
@@ -167,8 +167,10 @@ def native_files(net, policy, work, partials, spec):
     download(net, policy.hf("serve.patch"), patch_file, partials, spec["serve_patch_sha256"], 4 * MiB)
     diff = small_file(patch_file, 4 * MiB, pin=spec["serve_patch_sha256"], private=True)
     if not all(existing(qev / n) for n in policy.qev):
-        originals = {"qev/" + n: fetch(net, policy.one("qev/" + n), 2 * MiB) for n in policy.qev}
-        result = patched(originals, diff)
+        allowed = {"qev/" + n for n in policy.qev}
+        additions, normalized = new_files(diff, allowed)
+        originals = {n: fetch(net, policy.one(n), 2 * MiB) for n in sorted(allowed-additions)}
+        result = patched(originals, normalized, additions)
         for name, pin in policy.qev.items():
             require(sha(result["qev/" + name]) == pin, "patched qev postimage differs from native.py")
         for name in policy.qev:
