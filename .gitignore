@@ -11,6 +11,12 @@
 !/docs/
 !/locks/
 
+/.scratch/
+/docs/x-thread.md
+# Keep editable .excalidraw.json scenes; the image exports are local working files.
+/docs/figures/*.excalidraw
+/docs/figures/*.png
+/docs/figures/*.svg
 .research/
 local-config/
 joey-research-handoff/
